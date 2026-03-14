@@ -1,0 +1,93 @@
+
+---------------------------------------------
+| Network Config file: /app/pinos/examples/mesh11_lat
+---------------------------------------------
+| DRAM Config file: /app/PIMNode_DSE_o1/experiments/out_trace_demo/pinos_run/dram_patched.cfg
+---------------------------------------------
+Max address: 0x8000000 (Byte).
+# 0%
+# 5%
+# 10%
+# 15%
+# 20%
+# 25%
+# 30%
+# 35%
+# 40%
+# 45%
+# 50%
+# 55%
+# 60%
+# 65%
+# 70%
+# 75%
+# 80%
+# 85%
+# 90%
+# 95%
+# 100%
+
+[33m@clk: 151553536 all cores run out of trace, cleaning the all node Buffer.[0m
+
+[33m@clk: 151553536 NOC is clean.[0m
+
+clk: 151553536 Core[ 0] #retired_inst: 151536128
+
+[34m---------System Cofiguration---------
+Core Config: 
+-> total cores: 1
+-> Guest CPU: No Guest CPU
+-> Instruction Window: ipc = 1, depth = 128
+-> L1 Cache: 	size: 256KB assoc: 8 block_Sz: 64 mshr_num: 16
+-> L2 Cache: 	size: 1024KB assoc: 8 block_Sz: 64 mshr_num: 16
+-> LLC: No L3 Cache
+
+DRAM Config: 
+-> total DRAM banks: 1
+-> bank size: 
+-> DRAM speed: nDRAM_1600H
+
+---------Simulation  Statisc---------
+-> cycles: 1.51554e+08
+-> total memory instructions: 17408
+-> total no-memory instructions: 151527936
+-> average_ipc: 0.999946
+-> total instructions: 151545344
+-> total time: 1.89442e+08ns
+-------------------------------------[0m
+===>Total total_read_req: 96, total_write_req: 0
+[35mBank[ 0] Total Access:        96 MAX: core[ 0]--100.000%, MIN: core[ 0]--100.000%
+[33mthe Max buffer size @node is 0[0m
+Draining remaining packets ...
+Time taken is 303107072 cycles
+[32m====== Overall Traffic Statistics ======
+====== Traffic class 0 ======
+Packet latency average = -nan (1 samples)
+	minimum = nan (1 samples)
+	maximum = -nan (1 samples)
+Network latency average = -nan (1 samples)
+	minimum = nan (1 samples)
+	maximum = -nan (1 samples)
+Flit latency average = -nan (1 samples)
+	minimum = nan (1 samples)
+	maximum = -nan (1 samples)
+Fragmentation average = -nan (1 samples)
+	minimum = nan (1 samples)
+	maximum = -nan (1 samples)
+Injected packet rate average = 0 (1 samples)
+	minimum = 0 (1 samples)
+	maximum = 0 (1 samples)
+Accepted packet rate average = 0 (1 samples)
+	minimum = 0 (1 samples)
+	maximum = 0 (1 samples)
+Injected flit rate average = 0 (1 samples)
+	minimum = 0 (1 samples)
+	maximum = 0 (1 samples)
+Accepted flit rate average = 0 (1 samples)
+	minimum = 0 (1 samples)
+	maximum = 0 (1 samples)
+Injected packet size average = -nan (1 samples)
+Accepted packet size average = -nan (1 samples)
+Hops average = -nan (1 samples)
+======Simulation Done======[0m
+[33m==>>>Total PINOS run time: 40.9782 sec<<<==[0m

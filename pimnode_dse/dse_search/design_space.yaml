@@ -1,0 +1,196 @@
+hardware:
+  dram_cfg_path:
+    values:
+      - "pimnode_dse/dse_search/dram_cfgs/ddr4_2400r_x16_ch8_r1_b1.cfg"
+      - "pimnode_dse/dse_search/dram_cfgs/ddr4_3200aa_x8_ch16_r2_b4.cfg"
+    description: "Search over concrete DRAM cfg files. Runtime DRAM truth must come only from these cfg files, not from duplicated fields in the search point."
+
+  sram:
+    capacity_bytes:
+      values: [262144, 524288, 1048576]
+      description: "On-chip SRAM capacity in bytes. This maps directly to arch_from_mapping()."
+
+    bandwidth_bpc:
+      values: [128.0, 256.0, 512.0]
+      description: "Aggregate SRAM bandwidth in bytes per cycle. This maps directly to arch_from_mapping()."
+
+    bank_count:
+      values: [4]
+      description: "SRAM bank count. This maps directly to arch_from_mapping()."
+
+  de:
+    bus_bandwidth_bpc:
+      values: [128.0, 256.0, 512.0]
+      description: "DE-side bus bandwidth in bytes per cycle. This maps directly to arch_from_mapping()."
+
+    supports_pipeline:
+      values: [true, false]
+      description: "Whether DE supports pipelined overlap between movement and compute. This maps directly to arch_from_mapping()."
+
+    max_inflight_tiles:
+      values: [1, 2, 3]
+      description: "Maximum number of inflight tiles allowed by the DE pipeline. This maps directly to arch_from_mapping()."
+
+  pe:
+    rows:
+      values: [4, 8, 16]
+      description: "PE array row count. This maps directly to arch_from_mapping()."
+
+    cols:
+      values: [4, 8, 16]
+      description: "PE array column count. This maps directly to arch_from_mapping()."
+
+    macs_per_pe_per_cycle:
+      values: [1, 2, 4]
+      description: "MAC throughput per PE per cycle. This maps directly to arch_from_mapping()."
+
+    input_bandwidth_bpc:
+      values: [32.0, 64.0, 128.0, 256.0, 512.0]
+      description: "Aggregate PE input feed bandwidth in bytes per cycle. This maps directly to arch_from_mapping()."
+
+    output_bandwidth_bpc:
+      values: [32.0, 64.0, 128.0, 256.0, 512.0]
+      description: "Aggregate PE output drain bandwidth in bytes per cycle. This maps directly to arch_from_mapping()."
+
+  global:
+    bytes_per_element_default:
+      values: [2]
+      description: "Default bytes per element. Fixed for current experiments. This maps directly to arch_from_mapping()."
+
+fusion:
+  fusion_style:
+    values: ["SEQUENTIAL", "PIPELINE"]
+    description: "Candidate fusion styles."
+
+  max_group_size:
+    values: [1, 2, 4]
+    description: "Maximum number of ops in one fusion group."
+
+  allow_cross_phase_fusion:
+    values: [false]
+    description: "Whether ops from different phases may be fused."
+
+  special_roles:
+    values: [null, "ATTN_CORE", "KV_CACHE"]
+    description: "Optional special semantic role attached to a fusion group."
+
+placement:
+  templates:
+    values: ["MaxReuse", "Balanced", "MinReuse", "K-D Fusion"]
+    description: "Named placement templates from placement/templates.py."
+
+  phase_filter:
+    values: ["prefill", "decode"]
+    description: "Supported execution phases for filtering templates."
+
+  resident_policy:
+    values: [null, "input_stationary", "weight_stationary", "output_stationary"]
+    description: "Tensor residency / stationary preference."
+
+  allow_writeback:
+    values: [true, false]
+    description: "Whether writeback-producing placements are allowed."
+
+  allow_evict:
+    values: [true, false]
+    description: "Whether evict-producing placements are allowed."
+
+tiling:
+  hierarchy:
+    values:
+      - ["DRAM", "SRAM", "PE"]
+    description: "Searchable tiling hierarchy. DE is treated as SRAM-side intermediate buffering/control capability, not as an independent tiling level."
+
+  searched_dims:
+    values:
+      - ["q", "k", "dh"]
+    description: "Primary searched tiling dimensions corresponding to Sq, Skv, Dh."
+
+  fixed_strategy:
+    batch:
+      values: ["no_tile"]
+      description: "Batch dimension B is fixed and not searched."
+
+    hq:
+      values: ["full"]
+      description: "Query-head dimension Hq is fixed and not searched."
+
+    hkv:
+      values: ["full"]
+      description: "KV-head/group dimension Hkv is fixed and not searched."
+
+  dram_tile:
+    q: [64, 128, 256]
+    k: [64, 128, 256]
+    dh: [32, 64, 128]
+    description: "Candidate DRAM-level tile extents for Sq / Skv / Dh. This represents the transfer granularity from DRAM to SRAM."
+
+  sram_tile:
+    q: [8, 16, 32, 64]
+    k: [8, 16, 32, 64]
+    dh: [32, 64]
+    description: "Candidate SRAM-level tile extents for on-chip intermediate buffering and reuse."
+
+  pe_tile:
+    q: [8, 16]
+    k: [8, 16]
+    dh: [16, 32, 64]
+    description: "Candidate PE-level compute tile extents."
+
+  loop_order:
+    values:
+      - ["q", "k", "dh"]
+      - ["q", "dh", "k"]
+      - ["k", "q", "dh"]
+      - ["k", "dh", "q"]
+      - ["dh", "q", "k"]
+      - ["dh", "k", "q"]
+    description: "Candidate loop orders for Sq / Skv / Dh."
+
+  spatial_mapping:
+    pe:
+      values: [true, false]
+      description: "Whether PE-level execution is spatial."
+
+    sram:
+      values: [false]
+      description: "Whether SRAM-level execution is spatial."
+
+constraints:
+  - name: "pipeline_fusion_requires_de_pipeline_support"
+    when:
+      fusion.fusion_style: "PIPELINE"
+    require:
+      hardware.de.supports_pipeline: true
+
+  - name: "inflight_tiles_require_pipeline_support"
+    when_any:
+      - hardware.de.max_inflight_tiles: 2
+      - hardware.de.max_inflight_tiles: 3
+    require:
+      hardware.de.supports_pipeline: true
+
+  - name: "kd_fusion_requires_attn_role"
+    when:
+      placement.templates: "K-D Fusion"
+    require:
+      fusion.special_roles: "ATTN_CORE"
+
+  - name: "pe_spatial_prefers_larger_arrays"
+    when:
+      tiling.spatial_mapping.pe: true
+    require_any:
+      - hardware.pe.rows: 8
+      - hardware.pe.rows: 16
+      - hardware.pe.cols: 8
+      - hardware.pe.cols: 16
+
+notes:
+  - "This file describes the searchable parameter space and fixed policies, not fully materialized candidates."
+  - "Hardware search points now follow the configuration-dictionary scheme used by arch_from_mapping()."
+  - "DRAM runtime truth comes only from dram_cfg_path and the referenced cfg file."
+  - "Static constraints here should be applied before Stage A dynamic pruning."
+  - "Stage A should enforce SRAM capacity, bandwidth upper bounds, workload-shape feasibility, and prune placement keys with zero feasible tilings."
+  - "Short-term tiling search covers Sq / Skv / Dh only; B / Hq / Hkv are fixed by policy."
+  - "DRAM tile means the transfer granularity from DRAM to SRAM."
+  - "DE is modeled as SRAM-side movement/compute overlap capability and is not exposed as an independent tiling level."

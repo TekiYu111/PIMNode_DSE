@@ -1,21 +1,21 @@
-# placement/rules.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, Mapping, Protocol, Sequence
 
 from pimnode_dse.placement.placement_ir import (
-    DEFAULT_MEMORY_LEVELS,
-    BoundaryAction,
-    PlacementScope,
-    ResidentSet,
-    empty_boundary_action,
-    normalize_scope,
+    PlacementBoundary,
+    PlacementDomain,
+    ResidencySpec,
+    Site,
+    StorageTier,
+    TensorPlacementSpec,
+    TransferAction,
+    TransferSpec,
 )
 
 # -----------------------------------------------------------------------------
-# Canonical logical roles
+# Canonical logical tensor roles used by placement templates / instantiated specs
 # -----------------------------------------------------------------------------
 ROLE_Q = "Q"
 ROLE_K = "K"
@@ -27,456 +27,577 @@ ROLE_PARTIAL_O = "PARTIAL_O"
 ROLE_O = "O"
 ROLE_KV_CACHE = "KV_CACHE"
 
-READ_ONLY_ROLES: Set[str] = {
+ALL_KNOWN_ROLES = {
     ROLE_Q,
     ROLE_K,
     ROLE_V,
-    ROLE_KV_CACHE,
     ROLE_SCORES,
-    ROLE_PROBS,
-}
-
-WRITABLE_ROLES: Set[str] = {
     ROLE_STATS,
+    ROLE_PROBS,
     ROLE_PARTIAL_O,
     ROLE_O,
+    ROLE_KV_CACHE,
 }
 
-PHASE_PREFILL = "prefill"
-PHASE_DECODE = "decode"
+ROLE_TO_DOMAIN_SPACE: Dict[str, set[PlacementDomain]] = {
+    ROLE_Q: {PlacementDomain.OPERAND},
+    ROLE_K: {PlacementDomain.OPERAND},
+    ROLE_V: {PlacementDomain.OPERAND},
+    ROLE_SCORES: {PlacementDomain.FORWARD},
+    ROLE_STATS: {PlacementDomain.ACCUM},
+    ROLE_PROBS: {PlacementDomain.FORWARD},
+    ROLE_PARTIAL_O: {PlacementDomain.ACCUM},
+    ROLE_O: {PlacementDomain.ACCUM, PlacementDomain.FORWARD},
+    ROLE_KV_CACHE: {PlacementDomain.STATE},
+}
 
 
 # -----------------------------------------------------------------------------
-# Action node (lightweight, builder-consumable)
+# Public context / diagnostics / result objects
 # -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ActionNode:
     tensor: str
-    mem: str                     # 'PE', 'SRAM', 'DRAM'
-    action: str                  # 'LOAD', 'PREFETCH', 'WRITEBACK', 'EVICT'
-    scope: str
+    site: Site
+    boundary: PlacementBoundary
+    action: TransferAction
     phase: str = ""
-    role: Optional[str] = None
-    metadata: Dict[str, object] = field(default_factory=dict)
+    role: str | None = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuleViolation:
+    family: str  # semantic / placement / flow / hardware
+    tensor: str
+    message: str
+    severity: str = "error"  # error / warning
+    site: Site | None = None
+    boundary: PlacementBoundary | None = None
+    action: TransferAction | None = None
+
+
+@dataclass
+class RuleResult:
+    normalized_spec: TensorPlacementSpec
+    violations: list[RuleViolation]
+    actions: list[ActionNode]
+
+    @property
+    def is_valid(self) -> bool:
+        return not any(v.severity == "error" for v in self.violations)
+
+
+@dataclass
+class RuleContext:
+    phase: str = ""
+    tensor_to_role: Dict[str, str] = field(default_factory=dict)
+    tensor_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    hardware_limits: Dict[str, Any] = field(default_factory=dict)
 
 
 # -----------------------------------------------------------------------------
-# Metadata / role helpers
+# Small helpers
 # -----------------------------------------------------------------------------
-def canonicalize_phase(phase: Optional[str]) -> str:
-    if not phase:
-        return ""
-    p = phase.strip().lower()
-    if p == "prefill":
-        return PHASE_PREFILL
-    if p == "decode":
-        return PHASE_DECODE
-    return phase
+def canonicalize_phase(phase: str | None) -> str:
+    return (phase or "").strip().lower()
 
 
-def _safe_get_tensor_meta(
-    tensor: str,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> Mapping[str, object]:
-    if not tensor_meta:
-        return {}
-    return tensor_meta.get(tensor, {})
-
-
-def get_tensor_role(
-    tensor: str,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> Optional[str]:
-    """
-    Resolve the logical role of a concrete tensor name.
-
-    Priority:
-      1) explicit tensor_to_role mapping
-      2) tensor_meta[tensor]['role']
-      3) tensor_meta[tensor]['special_role']
-      4) lightweight name fallback
-    """
+def get_tensor_role(tensor: str, tensor_to_role: Mapping[str, str] | None = None) -> str:
     if tensor_to_role and tensor in tensor_to_role:
         return tensor_to_role[tensor]
 
-    meta = _safe_get_tensor_meta(tensor, tensor_meta)
-    if "role" in meta and meta["role"]:
-        return str(meta["role"])
-    if "special_role" in meta and meta["special_role"]:
-        return str(meta["special_role"])
-
-    # Very light fallback only for debugging / partial migration.
-    upper_name = tensor.upper()
-    if upper_name in {
-        ROLE_Q,
-        ROLE_K,
-        ROLE_V,
-        ROLE_SCORES,
-        ROLE_STATS,
-        ROLE_PROBS,
-        ROLE_PARTIAL_O,
-        ROLE_O,
-        ROLE_KV_CACHE,
-    }:
-        return upper_name
-
-    # Common substring fallback during transition.
-    if "KV_CACHE" in upper_name:
+    upper = tensor.upper()
+    if "KV" in upper and "CACHE" in upper:
         return ROLE_KV_CACHE
-    if "PARTIAL" in upper_name and "O" in upper_name:
+    if "PARTIAL" in upper and "O" in upper:
         return ROLE_PARTIAL_O
-    if "STAT" in upper_name:
-        return ROLE_STATS
-    if upper_name.startswith("Q"):
-        return ROLE_Q
-    if upper_name.startswith("K"):
-        return ROLE_K
-    if upper_name.startswith("V"):
-        return ROLE_V
-    if "SCORE" in upper_name:
+    if upper.endswith("SCORES") or "SCORE" in upper:
         return ROLE_SCORES
-    if "PROB" in upper_name:
+    if upper.endswith("PROBS") or "PROB" in upper:
         return ROLE_PROBS
-    if upper_name == "O" or upper_name.startswith("O_") or upper_name.endswith("_O"):
+    if upper.endswith("STATS") or "STAT" in upper:
+        return ROLE_STATS
+    if upper == "Q" or upper.startswith("Q_") or "QUERY" in upper:
+        return ROLE_Q
+    if upper == "K" or upper.startswith("K_") or "KEY" in upper:
+        return ROLE_K
+    if upper == "V" or upper.startswith("V_") or "VALUE" in upper:
+        return ROLE_V
+    if upper == "O" or upper.endswith("_O") or "OUTPUT" in upper:
         return ROLE_O
-
-    return None
-
-
-def is_read_only(
-    tensor: str,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> bool:
-    role = get_tensor_role(tensor, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-    return role in READ_ONLY_ROLES
+    return tensor
 
 
-def is_writable(
-    tensor: str,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> bool:
-    role = get_tensor_role(tensor, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-    return role in WRITABLE_ROLES
+def get_allowed_domains(role: str) -> set[PlacementDomain]:
+    return set(ROLE_TO_DOMAIN_SPACE.get(role, set()))
 
 
-def is_kv_cache(
-    tensor: str,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> bool:
-    role = get_tensor_role(tensor, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-    return role == ROLE_KV_CACHE
+def _unique_sorted_residency(items: Iterable[ResidencySpec]) -> list[ResidencySpec]:
+    uniq: Dict[tuple[str, Site], ResidencySpec] = {}
+    for item in items:
+        uniq[(item.tensor, item.site)] = item
+    return sorted(
+        uniq.values(),
+        key=lambda x: (
+            x.tensor,
+            str(x.site.storage_tier),
+            str(x.site.lifetime_scope),
+            str(x.site.domain),
+        ),
+    )
 
 
-def should_load_resident(
-    tensor: str,
-    mem: str,
-    phase: Optional[str],
-    *,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> bool:
-    """
-    Decide whether a resident tensor should materialize as an explicit LOAD action.
+def _unique_sorted_transfers(items: Iterable[TransferSpec]) -> list[TransferSpec]:
+    uniq: Dict[tuple[str, Site, PlacementBoundary, TransferAction], TransferSpec] = {}
+    for item in items:
+        uniq[(item.tensor, item.site, item.boundary, item.action)] = item
+    return sorted(
+        uniq.values(),
+        key=lambda x: (
+            x.tensor,
+            str(x.site.storage_tier),
+            str(x.site.lifetime_scope),
+            str(x.site.domain),
+            str(x.boundary),
+            str(x.action),
+        ),
+    )
 
-    Current minimal policy:
-      - SRAM / PE resident tensors get LOAD actions
-      - DRAM residents do not
-      - final O resident in DRAM is backing-store only, not a LOAD
-    """
-    if mem not in {"SRAM", "PE"}:
-        return False
 
-    role = get_tensor_role(tensor, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-    if role == ROLE_O and mem == "PE":
-        return True
-    return True
+def normalize_tensor_placement_spec(spec: TensorPlacementSpec) -> TensorPlacementSpec:
+    normalized = TensorPlacementSpec(tensor=spec.tensor)
+    normalized.residency = _unique_sorted_residency(spec.residency)
+    normalized.transfers = _unique_sorted_transfers(spec.transfers)
+    return normalized
+
+
+def _filtered_spec_by_domain(spec: TensorPlacementSpec, domain: PlacementDomain) -> TensorPlacementSpec:
+    filtered = TensorPlacementSpec(tensor=spec.tensor)
+    filtered.residency = [r for r in spec.residency if r.site.domain == domain]
+    filtered.transfers = [t for t in spec.transfers if t.site.domain == domain]
+    return filtered
 
 
 # -----------------------------------------------------------------------------
-# Hard rules
+# Domain policies (default allow-list style) + flow constraints
 # -----------------------------------------------------------------------------
-def _sanitize_boundary_action(
-    ba: BoundaryAction,
-    phase: str,
-    *,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-) -> BoundaryAction:
-    """
-    Apply local hard rules on one boundary action and return a sanitized copy.
-    """
-    phase = canonicalize_phase(phase)
+class DomainPolicy(Protocol):
+    domain: PlacementDomain
 
-    prefetch = set(ba.prefetch)
-    writeback = set(ba.writeback)
-    evict = set(ba.evict)
+    def is_valid_site(self, site: Site, ctx: RuleContext, tensor: str) -> bool: ...
 
-    # Rule 1: RO tensors are never writeback targets.
-    writeback = {
-        t for t in writeback
-        if not is_read_only(t, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
+    def allowed_actions(
+        self,
+        site: Site,
+        boundary: PlacementBoundary,
+        ctx: RuleContext,
+        tensor: str,
+    ) -> set[TransferAction]: ...
+
+    def check_flow(
+        self,
+        tensor: str,
+        spec: TensorPlacementSpec,
+        ctx: RuleContext,
+    ) -> list[RuleViolation]: ...
+
+
+class BaseDomainPolicy:
+    domain: PlacementDomain
+    allowed_storage_tiers: set[StorageTier] = set()
+    allowed_domains: set[PlacementDomain] = set()
+    enter_actions: set[TransferAction] = set()
+    exit_actions: set[TransferAction] = set()
+
+    def is_valid_site(self, site: Site, ctx: RuleContext, tensor: str) -> bool:
+        return site.domain in self.allowed_domains and site.storage_tier in self.allowed_storage_tiers
+
+    def allowed_actions(
+        self,
+        site: Site,
+        boundary: PlacementBoundary,
+        ctx: RuleContext,
+        tensor: str,
+    ) -> set[TransferAction]:
+        if boundary == PlacementBoundary.ENTER:
+            return set(self.enter_actions)
+        if boundary == PlacementBoundary.EXIT:
+            return set(self.exit_actions)
+        return set()
+
+    def check_flow(
+        self,
+        tensor: str,
+        spec: TensorPlacementSpec,
+        ctx: RuleContext,
+    ) -> list[RuleViolation]:
+        return []
+
+
+class OperandPolicy(BaseDomainPolicy):
+    domain = PlacementDomain.OPERAND
+    allowed_storage_tiers = {StorageTier.DRAM, StorageTier.SRAM, StorageTier.PE}
+    allowed_domains = {PlacementDomain.OPERAND}
+    enter_actions = {TransferAction.LOAD, TransferAction.PREFETCH}
+    exit_actions = {TransferAction.EVICT}
+
+
+class ForwardPolicy(BaseDomainPolicy):
+    domain = PlacementDomain.FORWARD
+    allowed_storage_tiers = {StorageTier.DRAM, StorageTier.SRAM}
+    allowed_domains = {PlacementDomain.FORWARD}
+    enter_actions = {TransferAction.LOAD, TransferAction.PREFETCH}
+    exit_actions = {TransferAction.EVICT}
+
+
+class AccumPolicy(BaseDomainPolicy):
+    domain = PlacementDomain.ACCUM
+    allowed_storage_tiers = {StorageTier.SRAM, StorageTier.PE}
+    allowed_domains = {PlacementDomain.ACCUM}
+    enter_actions = {TransferAction.LOAD}
+    exit_actions = {TransferAction.WRITEBACK, TransferAction.EVICT}
+
+    def check_flow(
+        self,
+        tensor: str,
+        spec: TensorPlacementSpec,
+        ctx: RuleContext,
+    ) -> list[RuleViolation]:
+        violations: list[RuleViolation] = []
+        has_accum_residency = any(r.site.domain == PlacementDomain.ACCUM for r in spec.residency)
+        has_writeback = any(
+            t.boundary == PlacementBoundary.EXIT and t.action == TransferAction.WRITEBACK
+            for t in spec.transfers
+        )
+        if has_accum_residency and not has_writeback:
+            violations.append(
+                RuleViolation(
+                    family="flow",
+                    tensor=tensor,
+                    message="accum-domain tensor has no EXIT->WRITEBACK path",
+                    severity="warning",
+                )
+            )
+        return violations
+
+
+class StatePolicy(BaseDomainPolicy):
+    domain = PlacementDomain.STATE
+    allowed_storage_tiers = {StorageTier.DRAM, StorageTier.SRAM}
+    allowed_domains = {PlacementDomain.STATE}
+    enter_actions = {TransferAction.LOAD, TransferAction.PREFETCH}
+    exit_actions = {TransferAction.WRITEBACK, TransferAction.EVICT}
+
+    def allowed_actions(
+        self,
+        site: Site,
+        boundary: PlacementBoundary,
+        ctx: RuleContext,
+        tensor: str,
+    ) -> set[TransferAction]:
+        allowed = super().allowed_actions(site, boundary, ctx, tensor)
+        meta = ctx.tensor_meta.get(tensor, {})
+        has_backing = meta.get("has_backing", site.storage_tier == StorageTier.DRAM)
+        if boundary == PlacementBoundary.EXIT and not has_backing:
+            allowed.discard(TransferAction.EVICT)
+        return allowed
+
+    def check_flow(
+        self,
+        tensor: str,
+        spec: TensorPlacementSpec,
+        ctx: RuleContext,
+    ) -> list[RuleViolation]:
+        violations: list[RuleViolation] = []
+        meta = ctx.tensor_meta.get(tensor, {})
+        has_backing = meta.get(
+            "has_backing",
+            any(r.site.storage_tier == StorageTier.DRAM for r in spec.residency),
+        )
+        for transfer in spec.transfers:
+            if transfer.boundary == PlacementBoundary.EXIT and transfer.action == TransferAction.EVICT and not has_backing:
+                violations.append(
+                    RuleViolation(
+                        family="flow",
+                        tensor=tensor,
+                        message="state-domain tensor cannot be evicted without a backing copy",
+                        site=transfer.site,
+                        boundary=transfer.boundary,
+                        action=transfer.action,
+                    )
+                )
+        return violations
+
+
+DOMAIN_POLICY_REGISTRY: Dict[PlacementDomain, DomainPolicy] = {
+    PlacementDomain.OPERAND: OperandPolicy(),
+    PlacementDomain.FORWARD: ForwardPolicy(),
+    PlacementDomain.ACCUM: AccumPolicy(),
+    PlacementDomain.STATE: StatePolicy(),
+}
+
+
+# -----------------------------------------------------------------------------
+# Constraint objects
+# -----------------------------------------------------------------------------
+class Constraint(Protocol):
+    def check(self, spec: TensorPlacementSpec, ctx: RuleContext) -> list[RuleViolation]: ...
+
+
+class SemanticConstraint:
+    def check(self, spec: TensorPlacementSpec, ctx: RuleContext) -> list[RuleViolation]:
+        violations: list[RuleViolation] = []
+        role = get_tensor_role(spec.tensor, ctx.tensor_to_role)
+        allowed_domains = get_allowed_domains(role)
+        if not allowed_domains:
+            violations.append(
+                RuleViolation(
+                    family="semantic",
+                    tensor=spec.tensor,
+                    message=f"unknown tensor role '{role}'",
+                    severity="warning",
+                )
+            )
+            return violations
+
+        allowed_domain_names = ", ".join(sorted(d.name for d in allowed_domains))
+        for residency in spec.residency:
+            if residency.site.domain not in allowed_domains:
+                violations.append(
+                    RuleViolation(
+                        family="semantic",
+                        tensor=spec.tensor,
+                        message=(
+                            f"role {role} does not allow residency domain {residency.site.domain.name}; "
+                            f"allowed domains: {allowed_domain_names}"
+                        ),
+                        site=residency.site,
+                    )
+                )
+        for transfer in spec.transfers:
+            if transfer.site.domain not in allowed_domains:
+                violations.append(
+                    RuleViolation(
+                        family="semantic",
+                        tensor=spec.tensor,
+                        message=(
+                            f"role {role} does not allow transfer domain {transfer.site.domain.name}; "
+                            f"allowed domains: {allowed_domain_names}"
+                        ),
+                        site=transfer.site,
+                        boundary=transfer.boundary,
+                        action=transfer.action,
+                    )
+                )
+                continue
+
+            policy = DOMAIN_POLICY_REGISTRY[transfer.site.domain]
+            allowed = policy.allowed_actions(transfer.site, transfer.boundary, ctx, spec.tensor)
+            if transfer.action not in allowed:
+                violations.append(
+                    RuleViolation(
+                        family="semantic",
+                        tensor=spec.tensor,
+                        message=(
+                            f"action {transfer.action.name} is not allowed for domain {transfer.site.domain.name} "
+                            f"at {transfer.boundary.name}"
+                        ),
+                        site=transfer.site,
+                        boundary=transfer.boundary,
+                        action=transfer.action,
+                    )
+                )
+        return violations
+
+
+class PlacementConstraint:
+    def check(self, spec: TensorPlacementSpec, ctx: RuleContext) -> list[RuleViolation]:
+        violations: list[RuleViolation] = []
+        role = get_tensor_role(spec.tensor, ctx.tensor_to_role)
+        allowed_domains = get_allowed_domains(role)
+        if not allowed_domains:
+            return violations
+
+        residency_sites = {r.site for r in spec.residency}
+        for residency in spec.residency:
+            if residency.site.domain not in allowed_domains:
+                continue
+            policy = DOMAIN_POLICY_REGISTRY[residency.site.domain]
+            if not policy.is_valid_site(residency.site, ctx, spec.tensor):
+                violations.append(
+                    RuleViolation(
+                        family="placement",
+                        tensor=spec.tensor,
+                        message=f"site is not a valid placement location for domain {residency.site.domain.name}",
+                        site=residency.site,
+                    )
+                )
+        for transfer in spec.transfers:
+            if transfer.site not in residency_sites:
+                violations.append(
+                    RuleViolation(
+                        family="placement",
+                        tensor=spec.tensor,
+                        message="transfer refers to a site where the tensor is not resident",
+                        site=transfer.site,
+                        boundary=transfer.boundary,
+                        action=transfer.action,
+                    )
+                )
+                continue
+            if transfer.site.domain not in allowed_domains:
+                continue
+            policy = DOMAIN_POLICY_REGISTRY[transfer.site.domain]
+            if not policy.is_valid_site(transfer.site, ctx, spec.tensor):
+                violations.append(
+                    RuleViolation(
+                        family="placement",
+                        tensor=spec.tensor,
+                        message=f"transfer site is not a valid placement location for domain {transfer.site.domain.name}",
+                        site=transfer.site,
+                        boundary=transfer.boundary,
+                        action=transfer.action,
+                    )
+                )
+        return violations
+
+
+class FlowConstraint:
+    def check(self, spec: TensorPlacementSpec, ctx: RuleContext) -> list[RuleViolation]:
+        violations: list[RuleViolation] = []
+        role = get_tensor_role(spec.tensor, ctx.tensor_to_role)
+        allowed_domains = get_allowed_domains(role)
+        if not allowed_domains:
+            return violations
+
+        domains_present = {
+            domain
+            for domain in allowed_domains
+            if any(r.site.domain == domain for r in spec.residency) or any(t.site.domain == domain for t in spec.transfers)
+        }
+
+        if spec.residency and not any(t.boundary == PlacementBoundary.ENTER for t in spec.transfers):
+            violations.append(
+                RuleViolation(
+                    family="flow",
+                    tensor=spec.tensor,
+                    message="resident tensor has no ENTER action",
+                    severity="warning",
+                )
+            )
+
+        for domain in domains_present:
+            domain_spec = _filtered_spec_by_domain(spec, domain)
+            policy = DOMAIN_POLICY_REGISTRY[domain]
+            violations.extend(policy.check_flow(spec.tensor, domain_spec, ctx))
+
+            exit_actions = [t for t in domain_spec.transfers if t.boundary == PlacementBoundary.EXIT]
+            if domain in {PlacementDomain.ACCUM, PlacementDomain.STATE} and domain_spec.residency and not exit_actions:
+                violations.append(
+                    RuleViolation(
+                        family="flow",
+                        tensor=spec.tensor,
+                        message=f"{domain.name}-domain tensor has no EXIT action",
+                        severity="warning",
+                    )
+                )
+        return violations
+
+
+class HardwareFeasibilityConstraint:
+    """Lightweight feasibility checks using optional hardware_limits.
+
+    Expected optional keys in ctx.hardware_limits:
+      - dram_bytes, sram_bytes, pe_bytes
+      - tensor_sizes: {tensor_name: bytes}
+    """
+
+    _TIER_KEY = {
+        StorageTier.DRAM: "dram_bytes",
+        StorageTier.SRAM: "sram_bytes",
+        StorageTier.PE: "pe_bytes",
     }
 
-    # Rule 2: phase-aware writeback / retention policy.
-    if phase == PHASE_DECODE:
-        # decode tends to preserve KV cache in-place; do not write back KV cache.
-        writeback = {
-            t for t in writeback
-            if not is_kv_cache(t, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-        }
-        # Also avoid evicting KV cache from fast memory in decode scopes.
-        evict = {
-            t for t in evict
-            if not is_kv_cache(t, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-        }
+    def check(self, spec: TensorPlacementSpec, ctx: RuleContext) -> list[RuleViolation]:
+        violations: list[RuleViolation] = []
+        limits = ctx.hardware_limits or {}
+        tensor_sizes = limits.get("tensor_sizes", {})
+        size = tensor_sizes.get(spec.tensor) or ctx.tensor_meta.get(spec.tensor, {}).get("size_bytes")
+        if size is None:
+            return violations
 
-    elif phase == PHASE_PREFILL:
-        # prefill allows rolling outputs / partial results to be written back.
-        # No extra action needed beyond removing RO tensors.
-        pass
-
-    # Rule 3: do not both prefetch and evict the same tensor at the same boundary.
-    evict -= prefetch
-
-    # Rule 4: avoid writeback + evict duplication for writable state.
-    # If a tensor is written back at this boundary, eviction is redundant in this IR.
-    evict -= writeback
-
-    return BoundaryAction(
-        mem=ba.mem,
-        prefetch=prefetch,
-        writeback=writeback,
-        evict=evict,
-    )
+        for residency in spec.residency:
+            limit_key = self._TIER_KEY.get(residency.site.storage_tier)
+            if not limit_key:
+                continue
+            cap = limits.get(limit_key)
+            if cap is not None and size > cap:
+                violations.append(
+                    RuleViolation(
+                        family="hardware",
+                        tensor=spec.tensor,
+                        message=(
+                            f"tensor replica size {size} exceeds {residency.site.storage_tier.name} "
+                            f"limit {cap}"
+                        ),
+                        site=residency.site,
+                    )
+                )
+        return violations
 
 
-def apply_hard_rules(
-    scope: PlacementScope,
-    phase: Optional[str],
-    *,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-    memories: Sequence[str] = DEFAULT_MEMORY_LEVELS,
-) -> PlacementScope:
-    """
-    Return a new PlacementScope with hard placement constraints applied.
-
-    This function is intentionally pure: it does not mutate the input scope.
-    """
-    phase = canonicalize_phase(phase or scope.phase)
-
-    normalized = normalize_scope(scope, memory_levels=memories)
-
-    new_boundary_actions: List[BoundaryAction] = []
-    for mem in memories:
-        ba = normalized.get_boundary_action(mem)
-        new_boundary_actions.append(
-            _sanitize_boundary_action(
-                ba,
-                phase=phase,
-                tensor_to_role=tensor_to_role,
-                tensor_meta=tensor_meta,
-            )
-        )
-
-    out = PlacementScope(
-        scope_name=normalized.scope_name,
-        resident_sets=[
-            ResidentSet(mem=rs.mem, tensors=set(rs.tensors))
-            for rs in normalized.resident_sets
-        ],
-        boundary_actions=new_boundary_actions,
-        phase=phase or normalized.phase,
-        special_role=normalized.special_role,
-        metadata=dict(normalized.metadata),
-    )
-    return normalize_scope(out, memory_levels=memories)
-
+DEFAULT_CONSTRAINTS: tuple[Constraint, ...] = (
+    SemanticConstraint(),
+    PlacementConstraint(),
+    FlowConstraint(),
+    HardwareFeasibilityConstraint(),
+)
 
 
 # -----------------------------------------------------------------------------
-# Derivation rules -> explicit actions
+# Public API
 # -----------------------------------------------------------------------------
-def _append_actions(
-    actions: List[ActionNode],
-    tensors: Iterable[str],
-    *,
-    mem: str,
-    action: str,
-    scope: PlacementScope,
-    phase: str,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-    extra_metadata: Optional[Mapping[str, object]] = None,
-) -> None:
-    for tensor in sorted(set(tensors)):
-        role = get_tensor_role(tensor, tensor_to_role=tensor_to_role, tensor_meta=tensor_meta)
-        metadata = dict(extra_metadata or {})
-        if role is not None:
-            metadata["role"] = role
+def derive_actions(spec: TensorPlacementSpec, ctx: RuleContext) -> list[ActionNode]:
+    role = get_tensor_role(spec.tensor, ctx.tensor_to_role)
+    phase = canonicalize_phase(ctx.phase)
+    actions: list[ActionNode] = []
+    for transfer in spec.transfers:
         actions.append(
             ActionNode(
-                tensor=tensor,
-                mem=mem,
-                action=action,
-                scope=scope.scope_name,
+                tensor=spec.tensor,
+                site=transfer.site,
+                boundary=transfer.boundary,
+                action=transfer.action,
                 phase=phase,
                 role=role,
-                metadata=metadata,
+                metadata=dict(ctx.tensor_meta.get(spec.tensor, {})),
             )
         )
+    return actions
 
 
-def derive_actions(
-    scope: PlacementScope,
-    phase: Optional[str],
+def apply_rules(
+    spec: TensorPlacementSpec,
     *,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-    memories: Sequence[str] = DEFAULT_MEMORY_LEVELS,
-    include_loads: bool = True,
-) -> List[ActionNode]:
-    """
-    Convert a concrete PlacementScope into explicit ActionNode objects.
-
-    Recommended flow:
-        scope2 = apply_hard_rules(scope, phase, tensor_to_role=..., tensor_meta=...)
-        actions = derive_actions(scope2, phase, tensor_to_role=..., tensor_meta=...)
-
-    This function is phase-aware and role-aware, but it consumes only concrete
-    tensor names, keeping builder integration simple.
-    """
-    phase = canonicalize_phase(phase or scope.phase)
-    normalized = normalize_scope(scope, memories=memories)
-
-    actions: List[ActionNode] = []
-
-    # Boundary actions first.
-    for mem in memories:
-        ba = normalized.get_boundary_action(mem)
-
-        _append_actions(
-            actions,
-            ba.prefetch,
-            mem=mem,
-            action="PREFETCH",
-            scope=normalized,
-            phase=phase,
-            tensor_to_role=tensor_to_role,
-            tensor_meta=tensor_meta,
-            extra_metadata={"boundary": "entry"},
-        )
-        _append_actions(
-            actions,
-            ba.writeback,
-            mem=mem,
-            action="WRITEBACK",
-            scope=normalized,
-            phase=phase,
-            tensor_to_role=tensor_to_role,
-            tensor_meta=tensor_meta,
-            extra_metadata={"boundary": "exit"},
-        )
-        _append_actions(
-            actions,
-            ba.evict,
-            mem=mem,
-            action="EVICT",
-            scope=normalized,
-            phase=phase,
-            tensor_to_role=tensor_to_role,
-            tensor_meta=tensor_meta,
-            extra_metadata={"boundary": "exit"},
-        )
-
-    # Resident loads after boundary actions.
-    if include_loads:
-        for rs in normalized.resident_sets:
-            for tensor in sorted(rs.tensors):
-                if should_load_resident(
-                    tensor,
-                    rs.mem,
-                    phase,
-                    tensor_to_role=tensor_to_role,
-                    tensor_meta=tensor_meta,
-                ):
-                    role = get_tensor_role(
-                        tensor,
-                        tensor_to_role=tensor_to_role,
-                        tensor_meta=tensor_meta,
-                    )
-                    actions.append(
-                        ActionNode(
-                            tensor=tensor,
-                            mem=rs.mem,
-                            action="LOAD",
-                            scope=normalized.scope_name,
-                            phase=phase,
-                            role=role,
-                            metadata={"resident": True},
-                        )
-                    )
-
-    return dedupe_actions(actions)
-
-
-# -----------------------------------------------------------------------------
-# Convenience pipeline
-# -----------------------------------------------------------------------------
-def apply_rules_and_derive_actions(
-    scope: PlacementScope,
-    phase: Optional[str],
-    *,
-    tensor_to_role: Optional[Mapping[str, str]] = None,
-    tensor_meta: Optional[Mapping[str, Mapping[str, object]]] = None,
-    memories: Sequence[str] = DEFAULT_MEMORY_LEVELS,
-    include_loads: bool = True,
-) -> Tuple[PlacementScope, List[ActionNode]]:
-    """
-    Convenience helper for builder / tests.
-    """
-    scoped = apply_hard_rules(
-        scope,
-        phase,
-        tensor_to_role=tensor_to_role,
-        tensor_meta=tensor_meta,
-        memories=memories,
+    phase: str = "",
+    tensor_to_role: Mapping[str, str] | None = None,
+    tensor_meta: Mapping[str, Mapping[str, Any]] | None = None,
+    hardware_limits: Mapping[str, Any] | None = None,
+    constraints: Sequence[Constraint] | None = None,
+) -> RuleResult:
+    ctx = RuleContext(
+        phase=canonicalize_phase(phase),
+        tensor_to_role=dict(tensor_to_role or {}),
+        tensor_meta={k: dict(v) for k, v in (tensor_meta or {}).items()},
+        hardware_limits=dict(hardware_limits or {}),
     )
-    actions = derive_actions(
-        scoped,
-        phase,
-        tensor_to_role=tensor_to_role,
-        tensor_meta=tensor_meta,
-        memories=memories,
-        include_loads=include_loads,
-    )
-    return scoped, actions
-
-
-# -----------------------------------------------------------------------------
-# Dedupe / formatting helpers
-# -----------------------------------------------------------------------------
-def dedupe_actions(actions: Sequence[ActionNode]) -> List[ActionNode]:
-    seen: Set[Tuple[str, str, str, str, str]] = set()
-    out: List[ActionNode] = []
-    for a in actions:
-        key = (a.tensor, a.mem, a.action, a.scope, a.phase)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(a)
-    return out
-
-
-def group_actions_by_mem(actions: Sequence[ActionNode]) -> Dict[str, List[ActionNode]]:
-    grouped: Dict[str, List[ActionNode]] = {}
-    for action in actions:
-        grouped.setdefault(action.mem, []).append(action)
-    return grouped
+    normalized = normalize_tensor_placement_spec(spec)
+    violations: list[RuleViolation] = []
+    for constraint in constraints or DEFAULT_CONSTRAINTS:
+        violations.extend(constraint.check(normalized, ctx))
+    actions = derive_actions(normalized, ctx)
+    return RuleResult(normalized_spec=normalized, violations=violations, actions=actions)
 
 
 __all__ = [
@@ -489,17 +610,23 @@ __all__ = [
     "ROLE_PARTIAL_O",
     "ROLE_O",
     "ROLE_KV_CACHE",
-    "PHASE_PREFILL",
-    "PHASE_DECODE",
+    "ALL_KNOWN_ROLES",
+    "ROLE_TO_DOMAIN_SPACE",
     "ActionNode",
+    "RuleViolation",
+    "RuleResult",
+    "RuleContext",
+    "DomainPolicy",
+    "DOMAIN_POLICY_REGISTRY",
+    "Constraint",
+    "SemanticConstraint",
+    "PlacementConstraint",
+    "FlowConstraint",
+    "HardwareFeasibilityConstraint",
+    "normalize_tensor_placement_spec",
     "canonicalize_phase",
     "get_tensor_role",
-    "is_read_only",
-    "is_writable",
-    "is_kv_cache",
-    "apply_hard_rules",
+    "get_allowed_domains",
     "derive_actions",
-    "apply_rules_and_derive_actions",
-    "dedupe_actions",
-    "group_actions_by_mem",
+    "apply_rules",
 ]

@@ -1,260 +1,245 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set
-
-# -----------------------------------------------------------------------------
-# Core aliases / defaults
-# -----------------------------------------------------------------------------
-MemoryLevel = str
-TensorName = str
-TensorRole = str
-
-DEFAULT_MEMORY_LEVELS: Sequence[MemoryLevel] = ("DRAM", "SRAM", "PE")
+from enum import Enum
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 
-# -----------------------------------------------------------------------------
-# Instantiated placement objects (consume by builder / attach to TileNode)
-# -----------------------------------------------------------------------------
+class PlacementNode(Enum):
+    """Tree nodes that may host placement sites."""
+
+    SCOPE_GROUP = "scope:group"
+    TILE_DRAM = "tile:DRAM"
+    TILE_SRAM = "tile:SRAM"
+    TILE_PE = "tile:PE"
+
+
+class PlacementDomain(Enum):
+    """Minimal behavior classes consumed by downstream analysis."""
+
+    OPERAND = "operand"
+    ACCUM = "accum"
+    FORWARD = "forward"
+    STATE = "state"
+
+
+class PlacementBoundary(Enum):
+    ENTER = "enter"
+    EXIT = "exit"
+
+
+class TransferAction(Enum):
+    LOAD = "LOAD"
+    PREFETCH = "PREFETCH"
+    WRITEBACK = "WRITEBACK"
+    EVICT = "EVICT"
+
+
 @dataclass(frozen=True)
-class ResidentSet:
-    """Actual tensors resident in a concrete memory level for one scope."""
+class Site:
+    """A placement site attached to a tree node plus a storage subdomain."""
 
-    mem: MemoryLevel
-    tensors: Set[TensorName] = field(default_factory=set)
+    node: PlacementNode
+    domain: PlacementDomain
 
 
 @dataclass(frozen=True)
-class BoundaryAction:
-    """Concrete boundary actions for a memory level at scope entry / exit."""
+class ResidencySpec:
+    """A concrete tensor is resident at a given site."""
 
-    mem: MemoryLevel
-    prefetch: Set[TensorName] = field(default_factory=set)
-    writeback: Set[TensorName] = field(default_factory=set)
-    evict: Set[TensorName] = field(default_factory=set)
+    tensor: str
+    site: Site
+
+
+@dataclass(frozen=True)
+class TransferSpec:
+    """A concrete tensor transfer occurs at a site boundary."""
+
+    tensor: str
+    site: Site
+    boundary: PlacementBoundary
+    action: TransferAction
 
 
 @dataclass
-class PlacementScope:
-    """Concrete, instantiated placement for a scope / fusion group.
-
-    This is the object the MappingBuilder should consume. It uses *real tensor
-    names* after template instantiation.
-    """
+class TensorPlacementSpec:
+    """Tensor-level placement skeleton for one scope/group."""
 
     scope_name: str
-    resident_sets: List[ResidentSet] = field(default_factory=list)
-    boundary_actions: List[BoundaryAction] = field(default_factory=list)
     phase: Optional[str] = None
-    special_role: Optional[str] = None
+    residency: List[ResidencySpec] = field(default_factory=list)
+    transfers: List[TransferSpec] = field(default_factory=list)
     metadata: Dict[str, object] = field(default_factory=dict)
 
-    def get_resident_tensors(self, mem: MemoryLevel) -> Set[TensorName]:
-        for rs in self.resident_sets:
-            if rs.mem == mem:
-                return set(rs.tensors)
-        return set()
+    def all_tensors(self) -> Set[str]:
+        tensors = {spec.tensor for spec in self.residency}
+        tensors.update(spec.tensor for spec in self.transfers)
+        return tensors
 
-    def get_boundary_action(self, mem: MemoryLevel) -> BoundaryAction:
-        for ba in self.boundary_actions:
-            if ba.mem == mem:
-                return BoundaryAction(
-                    mem=ba.mem,
-                    prefetch=set(ba.prefetch),
-                    writeback=set(ba.writeback),
-                    evict=set(ba.evict),
-                )
-        return empty_boundary_action(mem)
+    def sites_for_tensor(self, tensor: str) -> Set[Site]:
+        sites = {spec.site for spec in self.residency if spec.tensor == tensor}
+        sites.update(spec.site for spec in self.transfers if spec.tensor == tensor)
+        return sites
 
-    def memories(self) -> List[MemoryLevel]:
-        mems = {rs.mem for rs in self.resident_sets}
-        mems.update(ba.mem for ba in self.boundary_actions)
-        return sorted(mems)
-
-
-@dataclass
-class PlacementPlan:
-    """Concrete placement plan used by builder / tree materialization."""
-
-    scopes: Dict[str, PlacementScope] = field(default_factory=dict)
-
-    def get_scope(self, scope_name: str) -> PlacementScope:
-        return self.scopes[scope_name]
-
-    def get_resident_tensors(self, scope_name: str, mem: MemoryLevel) -> Set[TensorName]:
-        return self.get_scope(scope_name).get_resident_tensors(mem)
-
-    def get_boundary_action(self, scope_name: str, mem: MemoryLevel) -> BoundaryAction:
-        return self.get_scope(scope_name).get_boundary_action(mem)
-
-    def add_scope(self, scope: PlacementScope) -> None:
-        self.scopes[scope.scope_name] = scope
+    def validate_unique_specs(self) -> None:
+        resid_keys = {(spec.tensor, spec.site) for spec in self.residency}
+        if len(resid_keys) != len(self.residency):
+            raise ValueError(f"Duplicate residency specs found in scope '{self.scope_name}'")
+        transfer_keys = {
+            (spec.tensor, spec.site, spec.boundary, spec.action)
+            for spec in self.transfers
+        }
+        if len(transfer_keys) != len(self.transfers):
+            raise ValueError(f"Duplicate transfer specs found in scope '{self.scope_name}'")
 
 
-# -----------------------------------------------------------------------------
-# Template-level placement objects (role-based; instantiate before builder)
-# -----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class RoleResidentSet:
-    """Template resident set keyed by logical tensor roles, not real names."""
-
-    mem: MemoryLevel
-    tensor_roles: Set[TensorRole] = field(default_factory=set)
+# -----------------------------
+# Role-level template objects
+# -----------------------------
 
 
 @dataclass(frozen=True)
-class RoleBoundaryAction:
-    """Template boundary action keyed by logical tensor roles."""
+class RoleResidencySpec:
+    tensor_roles: Set[str]
+    site: Site
 
-    mem: MemoryLevel
-    prefetch_roles: Set[TensorRole] = field(default_factory=set)
-    writeback_roles: Set[TensorRole] = field(default_factory=set)
-    evict_roles: Set[TensorRole] = field(default_factory=set)
+
+@dataclass(frozen=True)
+class RoleTransferSpec:
+    tensor_roles: Set[str]
+    site: Site
+    boundary: PlacementBoundary
+    action: TransferAction
 
 
 @dataclass
-class PlacementTemplateScope:
-    """Role-based template before binding to a specific fusion group."""
+class RolePlacementTemplate:
+    """Role-based template to be instantiated per concrete scope/group."""
 
-    scope_name: str
-    resident_sets: List[RoleResidentSet] = field(default_factory=list)
-    boundary_actions: List[RoleBoundaryAction] = field(default_factory=list)
+    template_name: str
+    residency: List[RoleResidencySpec] = field(default_factory=list)
+    transfers: List[RoleTransferSpec] = field(default_factory=list)
     supported_phases: Set[str] = field(default_factory=set)
-    supported_roles: Set[str] = field(default_factory=set)
     metadata: Dict[str, object] = field(default_factory=dict)
+
+    def supports_phase(self, phase: Optional[str]) -> bool:
+        if not self.supported_phases or phase is None:
+            return True
+        return phase in self.supported_phases
 
 
 @dataclass
-class PlacementTemplatePlan:
-    """Template library keyed by template/scope name."""
+class RolePlacementTemplateLibrary:
+    templates: Dict[str, RolePlacementTemplate] = field(default_factory=dict)
 
-    scopes: Dict[str, PlacementTemplateScope] = field(default_factory=dict)
+    def add(self, template: RolePlacementTemplate) -> None:
+        if template.template_name in self.templates:
+            raise ValueError(f"Duplicate template name: {template.template_name}")
+        self.templates[template.template_name] = template
 
-    def get_scope(self, scope_name: str) -> PlacementTemplateScope:
-        return self.scopes[scope_name]
+    def names(self) -> List[str]:
+        return list(self.templates.keys())
 
-    def add_scope(self, scope: PlacementTemplateScope) -> None:
-        self.scopes[scope.scope_name] = scope
-
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def empty_boundary_action(mem: MemoryLevel) -> BoundaryAction:
-    return BoundaryAction(mem=mem, prefetch=set(), writeback=set(), evict=set())
+    def get(self, name: str) -> RolePlacementTemplate:
+        return self.templates[name]
 
 
-def normalize_scope(
-    scope: PlacementScope,
-    memory_levels: Sequence[MemoryLevel] = DEFAULT_MEMORY_LEVELS,
-    tensor_universe: Optional[Set[TensorName]] = None,
+# -----------------------------
+# Helper utilities
+# -----------------------------
+
+
+def canonicalize_phase(phase: Optional[str]) -> Optional[str]:
+    if phase is None:
+        return None
+    p = phase.strip().lower()
+    if p in {"prefill", "decode"}:
+        return p
+    raise ValueError(f"Unsupported phase: {phase}")
+
+
+def _resolve_roles(
+    role_bindings: Mapping[str, Sequence[str]],
+    roles: Iterable[str],
+) -> Set[str]:
+    tensors: Set[str] = set()
+    for role in roles:
+        tensors.update(role_bindings.get(role, ()))
+    return tensors
+
+
+def instantiate_tensor_placement(
+    template: RolePlacementTemplate,
+    scope_name: str,
+    role_bindings: Mapping[str, Sequence[str]],
     *,
-    memories: Optional[Sequence[MemoryLevel]] = None,
-) -> PlacementScope:
-    """Return a normalized concrete scope.
+    phase: Optional[str] = None,
+    tensor_universe: Optional[Iterable[str]] = None,
+    extra_metadata: Optional[Mapping[str, object]] = None,
+) -> TensorPlacementSpec:
+    """Instantiate a role-based template into concrete tensor placement."""
 
-    Guarantees:
-    - every requested memory level has one ResidentSet and one BoundaryAction
-    - duplicate memory entries are merged
-    - optional tensor_universe filtering keeps only tensors visible in this group
-    """
-    if memories is not None:
-        memory_levels = memories
-
-    resident_by_mem: Dict[MemoryLevel, Set[TensorName]] = {mem: set() for mem in memory_levels}
-    action_by_mem: Dict[MemoryLevel, BoundaryAction] = {
-        mem: empty_boundary_action(mem) for mem in memory_levels
-    }
-
-    for rs in scope.resident_sets:
-        resident_by_mem.setdefault(rs.mem, set()).update(rs.tensors)
-
-    for ba in scope.boundary_actions:
-        existing = action_by_mem.setdefault(ba.mem, empty_boundary_action(ba.mem))
-        action_by_mem[ba.mem] = BoundaryAction(
-            mem=ba.mem,
-            prefetch=set(existing.prefetch) | set(ba.prefetch),
-            writeback=set(existing.writeback) | set(ba.writeback),
-            evict=set(existing.evict) | set(ba.evict),
+    phase_canonical = canonicalize_phase(phase)
+    if not template.supports_phase(phase_canonical):
+        raise ValueError(
+            f"Template '{template.template_name}' does not support phase '{phase_canonical}'"
         )
 
-    if tensor_universe is not None:
-        for mem in list(resident_by_mem.keys()):
-            resident_by_mem[mem] &= tensor_universe
-        for mem, ba in list(action_by_mem.items()):
-            action_by_mem[mem] = BoundaryAction(
-                mem=mem,
-                prefetch=set(ba.prefetch) & tensor_universe,
-                writeback=set(ba.writeback) & tensor_universe,
-                evict=set(ba.evict) & tensor_universe,
+    allowed = set(tensor_universe) if tensor_universe is not None else None
+
+    residency: List[ResidencySpec] = []
+    for spec in template.residency:
+        tensors = _resolve_roles(role_bindings, spec.tensor_roles)
+        if allowed is not None:
+            tensors &= allowed
+        residency.extend(ResidencySpec(tensor=t, site=spec.site) for t in sorted(tensors))
+
+    transfers: List[TransferSpec] = []
+    for spec in template.transfers:
+        tensors = _resolve_roles(role_bindings, spec.tensor_roles)
+        if allowed is not None:
+            tensors &= allowed
+        transfers.extend(
+            TransferSpec(
+                tensor=t,
+                site=spec.site,
+                boundary=spec.boundary,
+                action=spec.action,
             )
+            for t in sorted(tensors)
+        )
 
-    return PlacementScope(
-        scope_name=scope.scope_name,
-        resident_sets=[ResidentSet(mem=mem, tensors=tensors) for mem, tensors in resident_by_mem.items()],
-        boundary_actions=[action_by_mem[mem] for mem in resident_by_mem.keys()],
-        phase=scope.phase,
-        special_role=scope.special_role,
-        metadata=dict(scope.metadata),
+    metadata: Dict[str, object] = {
+        "template_name": template.template_name,
+        **template.metadata,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    placement = TensorPlacementSpec(
+        scope_name=scope_name,
+        phase=phase_canonical,
+        residency=residency,
+        transfers=transfers,
+        metadata=metadata,
     )
+    placement.validate_unique_specs()
+    return placement
 
 
-def instantiate_template_scope(
-    template_scope: PlacementTemplateScope,
-    role_bindings: Mapping[TensorRole, Iterable[TensorName]],
-    *,
-    scope_name: Optional[str] = None,
-    phase: Optional[str] = None,
-    special_role: Optional[str] = None,
-    memory_levels: Sequence[MemoryLevel] = DEFAULT_MEMORY_LEVELS,
-    tensor_universe: Optional[Set[TensorName]] = None,
-    metadata: Optional[Mapping[str, object]] = None,
-) -> PlacementScope:
-    """Instantiate a role-based placement template into a concrete scope.
-
-    Parameters
-    ----------
-    template_scope:
-        Role-based template.
-    role_bindings:
-        Mapping from logical role (e.g. "Q", "K", "STATS") to actual tensor
-        names visible in the current fusion group.
-    scope_name:
-        Concrete scope name. Defaults to template_scope.scope_name.
-    """
-
-    def resolve_roles(role_set: Iterable[TensorRole]) -> Set[TensorName]:
-        out: Set[TensorName] = set()
-        for role in role_set:
-            out.update(role_bindings.get(role, set()))
-        return out
-
-    instantiated = PlacementScope(
-        scope_name=scope_name or template_scope.scope_name,
-        resident_sets=[
-            ResidentSet(mem=rs.mem, tensors=resolve_roles(rs.tensor_roles))
-            for rs in template_scope.resident_sets
-        ],
-        boundary_actions=[
-            BoundaryAction(
-                mem=ba.mem,
-                prefetch=resolve_roles(ba.prefetch_roles),
-                writeback=resolve_roles(ba.writeback_roles),
-                evict=resolve_roles(ba.evict_roles),
-            )
-            for ba in template_scope.boundary_actions
-        ],
-        phase=phase,
-        special_role=special_role,
-        metadata={**template_scope.metadata, **dict(metadata or {})},
-    )
-    return normalize_scope(
-        instantiated,
-        memory_levels=memory_levels,
-        tensor_universe=tensor_universe,
-    )
-
-
-def role_bindings_from_mapping(mapping: Mapping[str, Iterable[str]]) -> Dict[str, Set[str]]:
-    """Small utility to canonicalize role bindings into Set[str] values."""
-    return {key: set(values) for key, values in mapping.items()}
+__all__ = [
+    "PlacementNode",
+    "PlacementDomain",
+    "PlacementBoundary",
+    "TransferAction",
+    "Site",
+    "ResidencySpec",
+    "TransferSpec",
+    "TensorPlacementSpec",
+    "RoleResidencySpec",
+    "RoleTransferSpec",
+    "RolePlacementTemplate",
+    "RolePlacementTemplateLibrary",
+    "canonicalize_phase",
+    "instantiate_tensor_placement",
+]

@@ -5,22 +5,31 @@ from enum import Enum
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 
-class PlacementNode(Enum):
-    """Tree nodes that may host placement sites."""
+class StorageTier(Enum):
+    """Physical storage tiers in the PIM hierarchy."""
 
-    SCOPE_GROUP = "scope:group"
-    TILE_DRAM = "tile:DRAM"
-    TILE_SRAM = "tile:SRAM"
-    TILE_PE = "tile:PE"
+    DRAM = "DRAM"
+    SRAM = "SRAM"
+    PE = "PE"
+
+
+class LifetimeScope(Enum):
+    """How long a resident replica is intended to survive."""
+
+    GROUP = "group"
+    TILE = "tile"
+    INNER_TILE = "inner_tile"
+    OP = "op"
 
 
 class PlacementDomain(Enum):
-    """Minimal behavior classes consumed by downstream analysis."""
+    """Minimal behavioral classes consumed by downstream analysis."""
 
     OPERAND = "operand"
     ACCUM = "accum"
     FORWARD = "forward"
     STATE = "state"
+
 
 
 class PlacementBoundary(Enum):
@@ -37,15 +46,20 @@ class TransferAction(Enum):
 
 @dataclass(frozen=True)
 class Site:
-    """A placement site attached to a tree node plus a storage subdomain."""
+    """A placement site factorized into storage tier, lifetime scope and domain."""
 
-    node: PlacementNode
+    storage_tier: StorageTier
+    lifetime_scope: LifetimeScope
     domain: PlacementDomain
+
+
+    def short_name(self) -> str:
+        return f"{self.storage_tier.value}/{self.lifetime_scope.value}/{self.domain.value}"
 
 
 @dataclass(frozen=True)
 class ResidencySpec:
-    """A concrete tensor is resident at a given site."""
+    """A concrete tensor has a resident replica at a given site."""
 
     tensor: str
     site: Site
@@ -53,7 +67,13 @@ class ResidencySpec:
 
 @dataclass(frozen=True)
 class TransferSpec:
-    """A concrete tensor transfer occurs at a site boundary."""
+    """A concrete tensor transfer action is allowed/required at a site boundary.
+
+    Notes
+    -----
+    The movement direction is intentionally not encoded here. It is derived later
+    from the execution tree / scope nesting (TileFlow-style lowering).
+    """
 
     tensor: str
     site: Site
@@ -63,7 +83,7 @@ class TransferSpec:
 
 @dataclass
 class TensorPlacementSpec:
-    """Tensor-level placement skeleton for one scope/group."""
+    """Tensor-level placement skeleton for one concrete scope/group."""
 
     scope_name: str
     phase: Optional[str] = None
@@ -81,10 +101,17 @@ class TensorPlacementSpec:
         sites.update(spec.site for spec in self.transfers if spec.tensor == tensor)
         return sites
 
+    def residency_for_tensor(self, tensor: str) -> List[ResidencySpec]:
+        return [spec for spec in self.residency if spec.tensor == tensor]
+
+    def transfers_for_tensor(self, tensor: str) -> List[TransferSpec]:
+        return [spec for spec in self.transfers if spec.tensor == tensor]
+
     def validate_unique_specs(self) -> None:
         resid_keys = {(spec.tensor, spec.site) for spec in self.residency}
         if len(resid_keys) != len(self.residency):
             raise ValueError(f"Duplicate residency specs found in scope '{self.scope_name}'")
+
         transfer_keys = {
             (spec.tensor, spec.site, spec.boundary, spec.action)
             for spec in self.transfers
@@ -142,6 +169,47 @@ class RolePlacementTemplateLibrary:
 
     def get(self, name: str) -> RolePlacementTemplate:
         return self.templates[name]
+
+
+# -----------------------------
+# Canonical site helpers
+# -----------------------------
+
+
+def make_site(
+    storage_tier: StorageTier,
+    lifetime_scope: LifetimeScope,
+    domain: PlacementDomain,
+) -> Site:
+    return Site(
+        storage_tier=storage_tier,
+        lifetime_scope=lifetime_scope,
+        domain=domain,
+    )
+
+
+DEFAULT_SCOPE = LifetimeScope.TILE
+DEFAULT_STORAGE_TIERS: Sequence[StorageTier] = (
+    StorageTier.DRAM,
+    StorageTier.SRAM,
+    StorageTier.PE,
+)
+
+
+def default_site_map(
+    scope: LifetimeScope = DEFAULT_SCOPE,
+) -> Dict[str, Site]:
+    return {
+        "DRAM_OPERAND": make_site(StorageTier.DRAM, scope, PlacementDomain.OPERAND),
+        "DRAM_FORWARD": make_site(StorageTier.DRAM, scope, PlacementDomain.FORWARD),
+        "DRAM_STATE": make_site(StorageTier.DRAM, scope, PlacementDomain.STATE),
+        "SRAM_OPERAND": make_site(StorageTier.SRAM, scope, PlacementDomain.OPERAND),
+        "SRAM_FORWARD": make_site(StorageTier.SRAM, scope, PlacementDomain.FORWARD),
+        "SRAM_ACCUM": make_site(StorageTier.SRAM, scope, PlacementDomain.ACCUM),
+        "SRAM_STATE": make_site(StorageTier.SRAM, scope, PlacementDomain.STATE),
+        "PE_OPERAND": make_site(StorageTier.PE, scope, PlacementDomain.OPERAND),
+        "PE_ACCUM": make_site(StorageTier.PE, scope, PlacementDomain.ACCUM),
+    }
 
 
 # -----------------------------
@@ -228,7 +296,8 @@ def instantiate_tensor_placement(
 
 
 __all__ = [
-    "PlacementNode",
+    "StorageTier",
+    "LifetimeScope",
     "PlacementDomain",
     "PlacementBoundary",
     "TransferAction",
@@ -240,6 +309,10 @@ __all__ = [
     "RoleTransferSpec",
     "RolePlacementTemplate",
     "RolePlacementTemplateLibrary",
+    "make_site",
+    "DEFAULT_SCOPE",
+    "DEFAULT_STORAGE_TIERS",
+    "default_site_map",
     "canonicalize_phase",
     "instantiate_tensor_placement",
 ]

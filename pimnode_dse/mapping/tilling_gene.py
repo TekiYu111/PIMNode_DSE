@@ -1,364 +1,239 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
-import copy
-import hashlib
-import json
-import math
+from typing import Literal
+
+from pimnode_dse.placement.placement_ir import StorageTier
 
 
-MemLevel = Literal["DRAM", "SRAM", "RF", "PE"]
 OpScheduleStyle = Literal["sequential", "micro_pipeline"]
 
 
 @dataclass
-class GlobalTilingPolicy:
-    """Global knobs for tiling search / interpretation.
+class TierTileSpec:
+    """
+    Tier-level static tiling result.
 
-    This object intentionally stays lightweight. Placement-specific semantics
-    such as residency, writeback and lifetime must not be stored here.
+    This object only describes how a single storage tier is tiled.
+    It does NOT encode:
+      - placement semantics
+      - residency / writeback / boundary actions
+      - hardware budgets
+      - runtime tile generation logic
+
+    Fields:
+      storage_tier:
+          Which storage tier this tiling spec belongs to.
+
+      tile_size:
+          Per-dimension tile extent at this tier.
+
+      loop_order:
+          Traversal order of dimensions at this tier.
+
+      problem_size:
+          The local problem extent visible at this tier.
+          This is useful for debugging and later analysis.
     """
 
-    prefer_spatial_levels: List[str] = field(default_factory=list)
-    notes: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class MemTileSpec:
-    """Tiling description for a single memory level.
-
-    Upgraded semantics:
-    - tile_size:    local tile extent processed per iteration
-    - loop_order:   loop nesting / traversal order for this level
-    - problem_size: full visible problem size at this level
-    - loop_count:   actual loop count for this level
-
-    Backward compatibility:
-    - old code may still construct with:
-        fixed_tile_size=...
-        fixed_loop_order=...
-    - existing builder code can still call get_tile_spec() and receive
-      (tile_size, loop_order)
-    - runtime_tile_fn may return:
-        1) (tile_size, loop_order)
-        2) (tile_size, loop_order, problem_size, loop_count)
-        3) {
-             "tile_size": ...,
-             "loop_order": ...,
-             "problem_size": ...,
-             "loop_count": ...
-           }
-    """
-
-    mem_level: str
-
-    # New canonical fields
-    tile_size: Optional[Dict[str, int]] = None
-    loop_order: Optional[List[str]] = None
-    problem_size: Optional[Dict[str, int]] = None
-    loop_count: Optional[Dict[str, int]] = None
-
-    is_spatial: bool = False
-    active_dims: Optional[List[str]] = None
-    runtime_tile_fn: Optional[Callable[[Dict[str, Any]], Any]] = None
-
-    # Legacy compatibility fields
-    fixed_tile_size: Optional[Dict[str, int]] = None
-    fixed_loop_order: Optional[List[str]] = None
+    storage_tier: StorageTier
+    tile_size: dict[str, int]
+    loop_order: list[str]
+    problem_size: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # Normalize legacy -> canonical
-        if self.tile_size is None and self.fixed_tile_size is not None:
-            self.tile_size = dict(self.fixed_tile_size)
-        if self.loop_order is None and self.fixed_loop_order is not None:
-            self.loop_order = list(self.fixed_loop_order)
+        # Defensive copy to avoid accidental aliasing.
+        self.tile_size = dict(self.tile_size)
+        self.loop_order = list(self.loop_order)
+        self.problem_size = dict(self.problem_size)
+        self.validate()
 
-        # Keep legacy fields mirrored for older callers that may inspect attrs
-        if self.fixed_tile_size is None and self.tile_size is not None:
-            self.fixed_tile_size = dict(self.tile_size)
-        if self.fixed_loop_order is None and self.loop_order is not None:
-            self.fixed_loop_order = list(self.loop_order)
+    def validate(self) -> None:
+        if not isinstance(self.storage_tier, StorageTier):
+            raise TypeError("storage_tier must be a StorageTier")
 
-    def get_tile_desc(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        ctx = context or {}
+        if not self.tile_size:
+            raise ValueError(f"{self.storage_tier.name}: tile_size must not be empty")
 
-        if self.runtime_tile_fn is not None:
-            runtime_out = self.runtime_tile_fn(ctx)
-            return self._normalize_runtime_output(runtime_out)
+        for dim, size in self.tile_size.items():
+            if not isinstance(dim, str) or not dim:
+                raise ValueError(f"{self.storage_tier.name}: invalid tile dimension name {dim!r}")
+            if not isinstance(size, int) or size <= 0:
+                raise ValueError(
+                    f"{self.storage_tier.name}: tile_size[{dim!r}] must be a positive int, got {size!r}"
+                )
 
-        tile_size = dict(self.tile_size or {})
-        loop_order = list(self.loop_order or tile_size.keys())
-        problem_size = dict(self.problem_size or {})
-        loop_count = dict(self.loop_count or {})
+        if not self.loop_order:
+            raise ValueError(f"{self.storage_tier.name}: loop_order must not be empty")
 
-        if not loop_count and problem_size and tile_size:
-            loop_count = self._derive_loop_count(problem_size, tile_size)
+        seen: set[str] = set()
+        valid_dims = set(self.tile_size.keys()) | set(self.problem_size.keys())
 
-        return {
-            "tile_size": tile_size,
-            "loop_order": loop_order,
-            "problem_size": problem_size,
-            "loop_count": loop_count,
-        }
+        for dim in self.loop_order:
+            if not isinstance(dim, str) or not dim:
+                raise ValueError(f"{self.storage_tier.name}: invalid loop dimension name {dim!r}")
+            if dim in seen:
+                raise ValueError(f"{self.storage_tier.name}: duplicate dimension {dim!r} in loop_order")
+            seen.add(dim)
+            if dim not in valid_dims:
+                raise ValueError(
+                    f"{self.storage_tier.name}: loop_order dimension {dim!r} "
+                    "does not appear in tile_size or problem_size"
+                )
 
-    def get_tile_spec(
-        self,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Dict[str, int], List[str]]:
-        """Backward-compatible API used by current builder code."""
-        desc = self.get_tile_desc(context)
-        return dict(desc.get("tile_size", {})), list(desc.get("loop_order", []))
+        for dim, size in self.problem_size.items():
+            if not isinstance(dim, str) or not dim:
+                raise ValueError(f"{self.storage_tier.name}: invalid problem dimension name {dim!r}")
+            if not isinstance(size, int) or size <= 0:
+                raise ValueError(
+                    f"{self.storage_tier.name}: problem_size[{dim!r}] must be a positive int, got {size!r}"
+                )
 
-    def get_problem_size(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
-        return dict(self.get_tile_desc(context).get("problem_size", {}))
+        # When both are present, problem_size should not be smaller than tile_size.
+        for dim, tile_extent in self.tile_size.items():
+            if dim in self.problem_size and self.problem_size[dim] < tile_extent:
+                raise ValueError(
+                    f"{self.storage_tier.name}: problem_size[{dim!r}]={self.problem_size[dim]} "
+                    f"is smaller than tile_size[{dim!r}]={tile_extent}"
+                )
 
-    def get_loop_count(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
-        return dict(self.get_tile_desc(context).get("loop_count", {}))
-
-    def clone(self) -> "MemTileSpec":
-        return MemTileSpec(
-            mem_level=self.mem_level,
-            tile_size=dict(self.tile_size or {}) or None,
-            loop_order=list(self.loop_order or []) or None,
-            problem_size=dict(self.problem_size or {}) or None,
-            loop_count=dict(self.loop_count or {}) or None,
-            is_spatial=bool(self.is_spatial),
-            active_dims=list(self.active_dims) if self.active_dims else None,
-            runtime_tile_fn=self.runtime_tile_fn,
-            fixed_tile_size=dict(self.tile_size or {}) or None,
-            fixed_loop_order=list(self.loop_order or []) or None,
-        )
-
-    @staticmethod
-    def _derive_loop_count(
-        problem_size: Mapping[str, int],
-        tile_size: Mapping[str, int],
-    ) -> Dict[str, int]:
-        out: Dict[str, int] = {}
-        for dim, total in problem_size.items():
-            t = int(tile_size.get(dim, total))
-            total_i = int(total)
-            if t <= 0:
-                raise ValueError(f"tile_size[{dim!r}] must be > 0, got {t}")
-            out[dim] = int(math.ceil(total_i / t))
-        return out
-
-    def _normalize_runtime_output(self, runtime_out: Any) -> Dict[str, Any]:
-        if isinstance(runtime_out, dict):
-            tile_size = dict(runtime_out.get("tile_size", {}) or {})
-            loop_order = list(runtime_out.get("loop_order", []) or tile_size.keys())
-            problem_size = dict(runtime_out.get("problem_size", {}) or {})
-            loop_count = dict(runtime_out.get("loop_count", {}) or {})
-            if not loop_count and problem_size and tile_size:
-                loop_count = self._derive_loop_count(problem_size, tile_size)
-            return {
-                "tile_size": tile_size,
-                "loop_order": loop_order,
-                "problem_size": problem_size,
-                "loop_count": loop_count,
-            }
-
-        if isinstance(runtime_out, tuple) and len(runtime_out) == 2:
-            tile_size, loop_order = runtime_out
-            return {
-                "tile_size": dict(tile_size or {}),
-                "loop_order": list(loop_order or []),
-                "problem_size": {},
-                "loop_count": {},
-            }
-
-        if isinstance(runtime_out, tuple) and len(runtime_out) == 4:
-            tile_size, loop_order, problem_size, loop_count = runtime_out
-            tile_size = dict(tile_size or {})
-            loop_order = list(loop_order or tile_size.keys())
-            problem_size = dict(problem_size or {})
-            loop_count = dict(loop_count or {})
-            if not loop_count and problem_size and tile_size:
-                loop_count = self._derive_loop_count(problem_size, tile_size)
-            return {
-                "tile_size": tile_size,
-                "loop_order": loop_order,
-                "problem_size": problem_size,
-                "loop_count": loop_count,
-            }
-
-        raise TypeError(
-            "runtime_tile_fn must return either "
-            "(tile_size, loop_order), "
-            "(tile_size, loop_order, problem_size, loop_count), "
-            "or a dict with keys tile_size/loop_order/problem_size/loop_count"
+    def clone(self) -> "TierTileSpec":
+        return TierTileSpec(
+            storage_tier=self.storage_tier,
+            tile_size=dict(self.tile_size),
+            loop_order=list(self.loop_order),
+            problem_size=dict(self.problem_size),
         )
 
 
 @dataclass
 class GroupTilingSpec:
-    """Pure tiling spec for one fusion group.
+    """
+    Static tiling result for one fusion/op group.
 
-    Aligned with placement-first architecture:
-    - keeps only tiling/scheduling information
-    - does NOT encode residency/writeback/lifetime/storage policy
-    - optional phase/special_role are descriptive metadata or lookup keys
+    Fields:
+      group_id:
+          Identifier of the fusion group.
 
-    Suggested metadata usage for current short-term plan:
-    metadata = {
-        "searched_dims": ["Sq", "Skv", "Dh"],
-        "fixed_dim_policy": {
-            "B": "no_tile",
-            "Hq": "full",
-            "Hkv": "full",
-        }
-    }
+      tier_tiles:
+          Static tiling specs for tiers used by this group.
+
+      op_schedule_style:
+          Scheduling relation among the internal stages / ops of this group.
+          - "sequential": stages execute strictly in sequence
+          - "micro_pipeline": adjacent stages may form tile-granular pipeline
     """
 
     group_id: str
-    tiles: Dict[str, MemTileSpec] = field(default_factory=dict)
+    tier_tiles: dict[StorageTier, TierTileSpec]
     op_schedule_style: OpScheduleStyle = "sequential"
-    sram_budget_bytes: Optional[int] = None
-    phase: Optional[str] = None
-    special_role: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def get_mem_tile_spec(self, mem_level: str) -> MemTileSpec:
-        if mem_level not in self.tiles:
-            raise KeyError(f"MemTileSpec not found for level {mem_level}")
-        return self.tiles[mem_level]
+    def __post_init__(self) -> None:
+        self.tier_tiles = dict(self.tier_tiles)
+        self.validate()
 
-    def set_mem_tile_spec(self, mem_tile_spec: MemTileSpec) -> None:
-        self.tiles[mem_tile_spec.mem_level] = mem_tile_spec
+    def validate(self) -> None:
+        if not isinstance(self.group_id, str) or not self.group_id:
+            raise ValueError("group_id must be a non-empty string")
+
+        if self.op_schedule_style not in ("sequential", "micro_pipeline"):
+            raise ValueError(
+                "op_schedule_style must be either 'sequential' or 'micro_pipeline'"
+            )
+
+        if not self.tier_tiles:
+            raise ValueError(f"{self.group_id}: tier_tiles must not be empty")
+
+        for tier, spec in self.tier_tiles.items():
+            if not isinstance(tier, StorageTier):
+                raise TypeError(f"{self.group_id}: tier key must be a StorageTier, got {tier!r}")
+            if not isinstance(spec, TierTileSpec):
+                raise TypeError(
+                    f"{self.group_id}: tier_tiles[{tier!r}] must be a TierTileSpec, got {type(spec)!r}"
+                )
+            if spec.storage_tier != tier:
+                raise ValueError(
+                    f"{self.group_id}: tier key {tier.name} does not match "
+                    f"spec.storage_tier {spec.storage_tier.name}"
+                )
+            spec.validate()
+
+    def get_tier_tile_spec(self, storage_tier: StorageTier) -> TierTileSpec:
+        try:
+            return self.tier_tiles[storage_tier]
+        except KeyError as exc:
+            raise KeyError(
+                f"{self.group_id}: no tiling spec for tier {storage_tier.name}"
+            ) from exc
 
     def clone(self) -> "GroupTilingSpec":
         return GroupTilingSpec(
             group_id=self.group_id,
-            tiles={lvl: spec.clone() for lvl, spec in self.tiles.items()},
+            tier_tiles={tier: spec.clone() for tier, spec in self.tier_tiles.items()},
             op_schedule_style=self.op_schedule_style,
-            sram_budget_bytes=self.sram_budget_bytes,
-            phase=self.phase,
-            special_role=self.special_role,
-            metadata=copy.deepcopy(self.metadata),
         )
 
 
 @dataclass
 class TilingGene:
+    """
+    A complete static tiling design point across all groups.
+
+    Fields:
+      group_tiles:
+          Mapping from group_id to its static tier-level tiling result.
+
+      gene_id:
+          Optional identifier for external search / bookkeeping.
+          This module does not generate or interpret it.
+    """
+
+    group_tiles: dict[str, GroupTilingSpec]
     gene_id: str = ""
-    group_tiles: Dict[str, GroupTilingSpec] = field(default_factory=dict)
-    global_policy: GlobalTilingPolicy = field(default_factory=GlobalTilingPolicy)
-    phase_role_mapping: Dict[str, Dict[str, Dict[str, Dict[str, MemTileSpec]]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.gene_id:
-            self.gene_id = f"tiling_{self._hash_short(self.to_canonical_dict_without_gene_id())}"
-        for gid in self.group_tiles.keys():
-            if not isinstance(gid, str) or not gid:
-                raise ValueError(f"TilingGene.group_tiles contains invalid group_id: {gid!r}")
+        self.group_tiles = dict(self.group_tiles)
+        self.validate()
 
-    @property
-    def group_specs(self) -> Dict[str, GroupTilingSpec]:
-        return self.group_tiles
+    def validate(self) -> None:
+        if not self.group_tiles:
+            raise ValueError("group_tiles must not be empty")
 
-    def get_group_spec(
-        self,
-        group_id: str,
-        phase: Optional[str] = None,
-        role: Optional[str] = None,
-    ) -> Optional[GroupTilingSpec]:
-        base = self.group_tiles.get(group_id)
-        if base is None:
-            return None
+        for group_id, spec in self.group_tiles.items():
+            if not isinstance(group_id, str) or not group_id:
+                raise ValueError(f"invalid group_id key: {group_id!r}")
+            if not isinstance(spec, GroupTilingSpec):
+                raise TypeError(
+                    f"group_tiles[{group_id!r}] must be a GroupTilingSpec, got {type(spec)!r}"
+                )
+            if spec.group_id != group_id:
+                raise ValueError(
+                    f"group_tiles key {group_id!r} does not match spec.group_id {spec.group_id!r}"
+                )
+            spec.validate()
 
-        spec = base.clone()
-        if phase or role:
-            mem_map = self.phase_role_mapping.get(group_id, {}).get(phase or "", {}).get(role or "", {})
-            if mem_map:
-                for mem_level, mem_tile_spec in mem_map.items():
-                    spec.tiles[mem_level] = mem_tile_spec.clone()
-                if phase is not None:
-                    spec.phase = phase
-                if role is not None:
-                    spec.special_role = role
-        return spec
+    def get_group_spec(self, group_id: str) -> GroupTilingSpec:
+        try:
+            return self.group_tiles[group_id]
+        except KeyError as exc:
+            raise KeyError(f"no tiling spec found for group {group_id!r}") from exc
 
     def add_group_spec(self, group_spec: GroupTilingSpec) -> None:
+        if not isinstance(group_spec, GroupTilingSpec):
+            raise TypeError(f"group_spec must be a GroupTilingSpec, got {type(group_spec)!r}")
+        group_spec.validate()
         self.group_tiles[group_spec.group_id] = group_spec
 
-    def add_phase_role_mapping(
-        self,
-        group_id: str,
-        phase: str,
-        role: str,
-        mem_tile_specs: Mapping[str, MemTileSpec],
-    ) -> None:
-        cloned = {mem: spec.clone() for mem, spec in mem_tile_specs.items()}
-        self.phase_role_mapping.setdefault(group_id, {}).setdefault(phase, {})[role] = cloned
+    def clone(self) -> "TilingGene":
+        return TilingGene(
+            group_tiles={gid: spec.clone() for gid, spec in self.group_tiles.items()},
+            gene_id=self.gene_id,
+        )
 
-    def to_canonical_dict(self) -> Dict[str, Any]:
-        return {
-            "gene_id": self.gene_id,
-            "group_tiles": self._canonical_group_tiles(),
-            "global_policy": {
-                "prefer_spatial_levels": list(self.global_policy.prefer_spatial_levels),
-                "notes": copy.deepcopy(self.global_policy.notes),
-            },
-            "phase_role_mapping": self._canonical_phase_role_mapping(),
-        }
 
-    def to_canonical_dict_without_gene_id(self) -> Dict[str, Any]:
-        return {
-            "group_tiles": self._canonical_group_tiles(),
-            "global_policy": {
-                "prefer_spatial_levels": list(self.global_policy.prefer_spatial_levels),
-                "notes": copy.deepcopy(self.global_policy.notes),
-            },
-            "phase_role_mapping": self._canonical_phase_role_mapping(),
-        }
-
-    def _canonical_group_tiles(self) -> Dict[str, Any]:
-        canon_groups: Dict[str, Any] = {}
-        for gid, gspec in sorted(self.group_tiles.items()):
-            tiles_out: Dict[str, Any] = {}
-            for lvl, spec in sorted(gspec.tiles.items()):
-                tiles_out[lvl] = {
-                    "tile_size": dict(spec.tile_size or {}),
-                    "loop_order": list(spec.loop_order or []),
-                    "problem_size": dict(spec.problem_size or {}),
-                    "loop_count": dict(spec.loop_count or {}),
-                    "is_spatial": bool(spec.is_spatial),
-                    "active_dims": list(spec.active_dims) if spec.active_dims else None,
-                }
-            canon_groups[gid] = {
-                "tiles": tiles_out,
-                "op_schedule_style": gspec.op_schedule_style,
-                "sram_budget_bytes": gspec.sram_budget_bytes,
-                "phase": gspec.phase,
-                "special_role": gspec.special_role,
-                "metadata": copy.deepcopy(gspec.metadata),
-            }
-        return canon_groups
-
-    def _canonical_phase_role_mapping(self) -> Dict[str, Any]:
-        canon_mapping: Dict[str, Any] = {}
-        for gid, by_phase in sorted(self.phase_role_mapping.items()):
-            phase_out: Dict[str, Any] = {}
-            for phase, by_role in sorted(by_phase.items()):
-                role_out: Dict[str, Any] = {}
-                for role, mem_map in sorted(by_role.items()):
-                    role_out[role] = {
-                        mem: {
-                            "tile_size": dict(spec.tile_size or {}),
-                            "loop_order": list(spec.loop_order or []),
-                            "problem_size": dict(spec.problem_size or {}),
-                            "loop_count": dict(spec.loop_count or {}),
-                            "is_spatial": bool(spec.is_spatial),
-                            "active_dims": list(spec.active_dims) if spec.active_dims else None,
-                        }
-                        for mem, spec in sorted(mem_map.items())
-                    }
-                phase_out[phase] = role_out
-            canon_mapping[gid] = phase_out
-        return canon_mapping
-
-    @staticmethod
-    def _hash_short(obj: Any) -> str:
-        blob = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hashlib.sha1(blob).hexdigest()[:16]
+__all__ = [
+    "OpScheduleStyle",
+    "TierTileSpec",
+    "GroupTilingSpec",
+    "TilingGene",
+]

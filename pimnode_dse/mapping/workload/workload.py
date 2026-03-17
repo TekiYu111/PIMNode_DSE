@@ -154,7 +154,7 @@ class WorkloadDAG:
 
     ops: Dict[str, OpSpec] = field(default_factory=dict)
     tensors: Dict[str, TensorSpec] = field(default_factory=dict)
-    edges: Dict[Tuple[str, str], EdgeSpec] = field(default_factory=dict)
+    edges: List[EdgeSpec] = field(default_factory=list)
 
     # --------------------------
     # Add / register
@@ -219,7 +219,7 @@ class WorkloadDAG:
                 f"declared={edge.dst_dims}, expected={expected_dst_dims}"
             )
 
-        self.edges[(edge.src, edge.dst)] = edge
+        self.edges.append(edge)
 
     # --------------------------
     # Basic queries
@@ -247,38 +247,49 @@ class WorkloadDAG:
     def tensor(self, tensor_name: str) -> TensorSpec:
         return self.get_tensor(tensor_name)
 
-    def get_edge(self, u: str, v: str) -> EdgeSpec:
-        if (u, v) not in self.edges:
-            raise KeyError(f"Edge ({u!r} -> {v!r}) not found")
-        return self.edges[(u, v)]
+    def edge_list(self) -> List[EdgeSpec]:
+        return list(self.edges)
 
-    def edge(self, u: str, v: str) -> EdgeSpec:
-        return self.get_edge(u, v)
+    def get_edges_between(self, u: str, v: str) -> List[EdgeSpec]:
+        return [e for e in self.edges if e.src == u and e.dst == v]
+
+    def get_edge(self, u: str, v: str, tensor: Optional[str] = None) -> EdgeSpec:
+        matches = self.get_edges_between(u, v)
+        if tensor is not None:
+            matches = [e for e in matches if e.tensor == tensor]
+
+        if not matches:
+            raise KeyError(f"Edge ({u!r} -> {v!r}, tensor={tensor!r}) not found")
+        if len(matches) > 1 and tensor is None:
+            raise ValueError(
+                f"Multiple edges found for ({u!r} -> {v!r}); please specify tensor"
+            )
+        return matches[0]
 
     # --------------------------
     # Compatibility helpers
     # --------------------------
 
-    def get_edge_tensor_name(self, u: str, v: str) -> str:
-        return self.get_edge(u, v).tensor
+    def get_edge_tensor_name(self, u: str, v: str, tensor: Optional[str] = None) -> str:
+        return self.get_edge(u, v, tensor=tensor).tensor
 
-    def get_edge_logical_dims(self, u: str, v: str) -> Tuple[str, ...]:
+    def get_edge_logical_dims(self, u: str, v: str, tensor: Optional[str] = None) -> Tuple[str, ...]:
         """
         默认返回 producer 侧逻辑维度。
         给 fusion / tiling 用。
         """
-        return self.get_edge(u, v).src_dims
+        return self.get_edge(u, v, tensor=tensor).src_dims
 
-    def get_edge_tensor_shape(self, u: str, v: str) -> Tuple[int, ...]:
+    def get_edge_tensor_shape(self, u: str, v: str, tensor: Optional[str] = None) -> Tuple[int, ...]:
         """
         返回边上传递张量的数值 shape。
         给容量估计 / analysis 用。
         """
-        tname = self.get_edge(u, v).tensor
+        tname = self.get_edge(u, v, tensor=tensor).tensor
         return self.tensors[tname].shape
 
-    def get_edge_reduction_dims(self, u: str, v: str) -> Tuple[str, ...]:
-        edge = self.get_edge(u, v)
+    def get_edge_reduction_dims(self, u: str, v: str, tensor: Optional[str] = None) -> Tuple[str, ...]:
+        edge = self.get_edge(u, v, tensor=tensor)
         if edge.reduce_dims:
             return edge.reduce_dims
         return self.get_op(u).reduce_dims
@@ -288,16 +299,16 @@ class WorkloadDAG:
     # --------------------------
 
     def predecessors(self, op_id: str) -> List[str]:
-        return [u for (u, v) in self.edges if v == op_id]
+        return sorted({e.src for e in self.edges if e.dst == op_id})
 
     def successors(self, op_id: str) -> List[str]:
-        return [v for (u, v) in self.edges if u == op_id]
+        return sorted({e.dst for e in self.edges if e.src == op_id})
 
     def incoming_edges(self, op_id: str) -> List[EdgeSpec]:
-        return [edge for (u, v), edge in self.edges.items() if v == op_id]
+        return [edge for edge in self.edges if edge.dst == op_id]
 
     def outgoing_edges(self, op_id: str) -> List[EdgeSpec]:
-        return [edge for (u, v), edge in self.edges.items() if u == op_id]
+        return [edge for edge in self.edges if edge.src == op_id]
 
     def producer_of(self, tensor_name: str) -> Optional[str]:
         producers = [op_id for op_id, op in self.ops.items() if tensor_name in op.outputs]
@@ -323,9 +334,9 @@ class WorkloadDAG:
         temps: Set[str] = set()
         shared: Set[str] = set()
 
-        for (u, v), edge in self.edges.items():
-            u_in = u in op_set
-            v_in = v in op_set
+        for edge in self.edges:
+            u_in = edge.src in op_set
+            v_in = edge.dst in op_set
 
             if u_in and v_in:
                 temps.add(edge.tensor)
@@ -350,9 +361,9 @@ class WorkloadDAG:
         in_degree = {op_id: 0 for op_id in self.ops}
         adj: Dict[str, List[str]] = defaultdict(list)
 
-        for (u, v) in self.edges:
-            adj[u].append(v)
-            in_degree[v] += 1
+        for edge in self.edges:
+            adj[edge.src].append(edge.dst)
+            in_degree[edge.dst] += 1
 
         q = deque([op_id for op_id, deg in in_degree.items() if deg == 0])
         order: List[str] = []
@@ -405,13 +416,11 @@ class WorkloadDAG:
                     f"Op {op_id!r} reduce_dims must be subset of iter_dims: {sorted(unknown_reduce)}"
                 )
 
-        for (u, v), edge in self.edges.items():
-            if u not in self.ops or v not in self.ops:
-                raise KeyError(f"Invalid edge ({u!r} -> {v!r}) in WorkloadDAG")
+        for edge in self.edges:
+            if edge.src not in self.ops or edge.dst not in self.ops:
+                raise KeyError(f"Invalid edge ({edge.src!r} -> {edge.dst!r}) in WorkloadDAG")
             if edge.tensor not in self.tensors:
                 raise KeyError(f"Edge tensor {edge.tensor!r} is undefined")
-            if edge.src != u or edge.dst != v:
-                raise ValueError(f"Edge key and payload mismatch: key=({u},{v}), payload={edge}")
 
         self.topo_order()
 

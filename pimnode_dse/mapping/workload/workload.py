@@ -1,710 +1,685 @@
+"""
+Construct a WorkloadDAG for the given AttentionWorkloadSpec.
+Supports prefill/decode modes and MHA/GQA/MQA head configurations.
+
+This version models:
+  - decode cache update explicitly via K_CACHE_OUT / V_CACHE_OUT
+  - compute views explicitly via K_CTX / V_CTX
+  - head sharing explicitly via HeadBroadcast ops
+
+Notes on semantic fields:
+  - TensorSpec.role is the canonical coarse semantic role consumed by downstream
+    mapping / placement code (for example: Q / K / V / SCORES / PROBS / O / STATS).
+"""
 from __future__ import annotations
 
-from collections import defaultdict, deque
+import hashlib
+import json
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
-# ============================================================
-# AttentionWorkloadSpec
-# ============================================================
+class TensorType(str, Enum):
+    """Categorises how a tensor is used in the workload."""
 
-@dataclass(frozen=True)
-class AttentionWorkloadSpec:
-    mode: str           # "prefill" | "decode"
-    attn_type: str      # "mha" | "gqa" | "mqa"
-    B: int
-    Q_len: int
-    KV_len: int
-    Dh: int
-    Hq: int
-    Hkv: int
-    mask_type: str = "causal"
-    kv_cache_enabled: bool = False
-    dtype_bytes: int = 2
-    cache_len_before: Optional[int] = None
-    append_len: Optional[int] = None
-
-    @property
-    def group(self) -> int:
-        if self.Hkv <= 0:
-            raise ValueError("Hkv must be > 0")
-        return self.Hq // self.Hkv
-
-    @property
-    def KV_total(self) -> int:
-        if self.mode == "decode":
-            if self.cache_len_before is None or self.append_len is None:
-                raise ValueError("decode mode requires cache_len_before and append_len")
-            return self.cache_len_before + self.append_len
-        return self.KV_len
-
-    def validate(self) -> None:
-        if self.mode not in {"prefill", "decode"}:
-            raise ValueError(f"Unsupported mode: {self.mode!r}")
-        if self.attn_type not in {"mha", "gqa", "mqa"}:
-            raise ValueError(f"Unsupported attn_type: {self.attn_type!r}")
-
-        if self.B <= 0 or self.Q_len <= 0 or self.KV_len <= 0 or self.Dh <= 0:
-            raise ValueError("B, Q_len, KV_len, Dh must all be > 0")
-
-        if self.Hq <= 0 or self.Hkv <= 0:
-            raise ValueError("Hq and Hkv must be > 0")
-
-        if self.Hq % self.Hkv != 0:
-            raise ValueError("Hq must be divisible by Hkv")
-
-        if self.dtype_bytes <= 0:
-            raise ValueError("dtype_bytes must be > 0")
-
-        if self.mode == "decode":
-            if self.cache_len_before is None or self.append_len is None:
-                raise ValueError("decode mode requires cache_len_before and append_len")
-            if self.cache_len_before < 0 or self.append_len <= 0:
-                raise ValueError("cache_len_before must be >= 0 and append_len must be > 0")
+    ACTIVATION = "activation"
+    WEIGHT = "weight"
+    CACHE = "cache"
+    OUTPUT = "output"
 
 
-# ============================================================
-# TensorSpec
-# ============================================================
+class TensorRole(str, Enum):
+    """Canonical coarse semantic tensor roles used by downstream mapping code."""
+
+    Q = "Q"
+    K = "K"
+    V = "V"
+    SCORES = "SCORES"
+    STATS = "STATS"
+    PROBS = "PROBS"
+    O = "O"
+
 
 @dataclass(frozen=True)
 class TensorSpec:
+    """Describes a single tensor in the workload graph."""
+
     name: str
     shape: Tuple[int, ...]
-    dtype: str = "float32"
-    role: str = "intermediate"      # input / output / intermediate / state
-    special_role: Optional[str] = None
+    tensor_type: TensorType = TensorType.ACTIVATION
+    dtype: str = "float16"
+    role: Optional[TensorRole] = None
 
+    def num_elements(self) -> int:
+        result = 1
+        for d in self.shape:
+            result *= d
+        return result
 
-# ============================================================
-# DomainSpec
-# ============================================================
+    def size_bytes(self) -> int:
+        dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1}
+        return self.num_elements() * dtype_bytes.get(self.dtype, 2)
+
 
 @dataclass(frozen=True)
-class DomainSpec:
-    kind: str = "none"
-    params: Dict[str, Any] = field(default_factory=dict)
+class OpDataEdge:
+    """op -> op dataflow edge."""
 
-    def required_vars(self) -> Set[str]:
-        if self.kind == "none":
-            return set()
-        if self.kind in {"causal", "sliding_window", "block_sparse"}:
-            return {"m", "n"}
-        if self.kind == "decode_kv":
-            return set(self.params.get("vars", []))
-        return set(self.params.get("vars", []))
+    src_op: str
+    dst_op: str
+    tensor: str
+    src_dims: Tuple[str, ...] = ()
+    dst_dims: Tuple[str, ...] = ()
 
-
-# ============================================================
-# OpSpec
-# ============================================================
 
 @dataclass(frozen=True)
 class OpSpec:
-    """
-    算子节点：
-    - iter_dims: 逻辑迭代维度
-    - tensor_dims: 各输入/输出张量在该算子中的逻辑索引
-    - reduce_dims: 该算子的约简维度
-    """
+    """Operator specification in the workload DAG."""
+
     op_id: str
     op_type: str
-    inputs: List[str]
-    outputs: List[str]
-
+    inputs: Tuple[str, ...]
+    outputs: Tuple[str, ...]
     iter_dims: Tuple[str, ...] = ()
     tensor_dims: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     reduce_dims: Tuple[str, ...] = ()
-
-    phase: Optional[str] = None
+    reduce_type: str = "full"
     attrs: Dict[str, Any] = field(default_factory=dict)
+    dim_constraints: Dict[str, int] = field(default_factory=dict)
 
-
-# ============================================================
-# EdgeSpec
-# ============================================================
-
-@dataclass(frozen=True)
-class EdgeSpec:
-    """
-    数据流边是一等对象。
-
-    - src / dst: producer / consumer
-    - tensor: 边上传递的张量
-    - src_dims / dst_dims: 该张量在 producer / consumer 两侧的逻辑维度
-    - reduce_dims: 若这条边与 reduction 直接相关，可显式记录
-    """
-    src: str
-    dst: str
-    tensor: str
-    src_dims: Tuple[str, ...]
-    dst_dims: Tuple[str, ...]
-    reduce_dims: Tuple[str, ...] = ()
-
-
-# ============================================================
-# WorkloadDAG
-# ============================================================
 
 @dataclass
+class AttentionWorkloadSpec:
+    """High-level description of an attention workload."""
+
+    batch_size: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    seq_len: int
+    mode: str
+    attn_type: str
+    mask_type: str = "causal"
+    dtype: str = "float16"
+    cache_len_before: int = 0
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("prefill", "decode"):
+            raise ValueError(f"Unknown mode: {self.mode}")
+        if self.attn_type not in ("mha", "gqa", "mqa"):
+            raise ValueError(f"Unknown attn_type: {self.attn_type}")
+        if self.batch_size <= 0 or self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError("batch_size, num_heads, num_kv_heads must be > 0")
+        if self.head_dim <= 0 or self.seq_len <= 0:
+            raise ValueError("head_dim and seq_len must be > 0")
+        if self.mode == "prefill":
+            if self.cache_len_before != 0:
+                raise ValueError("cache_len_before must be 0 in prefill mode")
+        else:
+            if self.cache_len_before < 0:
+                raise ValueError("cache_len_before must be >= 0 in decode mode")
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        if self.attn_type == "mha" and self.num_kv_heads != self.num_heads:
+            raise ValueError("mha requires num_kv_heads == num_heads")
+        if self.attn_type == "mqa" and self.num_kv_heads != 1:
+            raise ValueError("mqa requires num_kv_heads == 1")
+        if self.attn_type == "gqa":
+            if self.num_kv_heads == self.num_heads:
+                raise ValueError("gqa requires num_kv_heads != num_heads")
+            if self.num_kv_heads == 1:
+                raise ValueError("gqa requires num_kv_heads != 1")
+
+    @property
+    def hq(self) -> int:
+        return self.num_heads
+
+    @property
+    def hkv(self) -> int:
+        return self.num_kv_heads
+
+    @property
+    def kv_head_broadcast(self) -> int:
+        return self.hq // self.hkv
+
+    def fingerprint(self) -> str:
+        d = {
+            "batch_size": self.batch_size,
+            "num_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "seq_len": self.seq_len,
+            "mode": self.mode,
+            "attn_type": self.attn_type,
+            "mask_type": self.mask_type,
+            "dtype": self.dtype,
+            "cache_len_before": self.cache_len_before,
+        }
+        raw = json.dumps(d, sort_keys=True)
+        return hashlib.md5(raw.encode()).hexdigest()[:8]
+
+
 class WorkloadDAG:
-    name: str
-    spec: Optional[AttentionWorkloadSpec] = None
+    """Directed acyclic graph representing the data flow of an attention workload."""
 
-    ops: Dict[str, OpSpec] = field(default_factory=dict)
-    tensors: Dict[str, TensorSpec] = field(default_factory=dict)
-    edges: List[EdgeSpec] = field(default_factory=list)
+    def __init__(self) -> None:
+        self._tensors: Dict[str, TensorSpec] = {}
+        self._ops: Dict[str, OpSpec] = {}
+        self._edges: List[OpDataEdge] = []
 
-    # --------------------------
-    # Add / register
-    # --------------------------
+        self._tensor_to_consumer_ops: Dict[str, List[str]] = {}
+        self._tensor_to_producer_op: Dict[str, Optional[str]] = {}
+        self._op_to_output_tensors: Dict[str, List[str]] = {}
+        self._op_to_input_tensors: Dict[str, List[str]] = {}
+        self._op_predecessors: Dict[str, List[str]] = {}
+        self._op_successors: Dict[str, List[str]] = {}
+        self._finalized: bool = False
 
-    def add_tensor(self, tensor: TensorSpec) -> None:
-        if tensor.name in self.tensors:
-            raise ValueError(f"Duplicate tensor name: {tensor.name}")
-        self.tensors[tensor.name] = tensor
+    def _invalidate(self) -> None:
+        self._finalized = False
+        self._tensor_to_consumer_ops = {}
+        self._tensor_to_producer_op = {}
+        self._op_to_output_tensors = {}
+        self._op_to_input_tensors = {}
+        self._op_predecessors = {}
+        self._op_successors = {}
 
-    def add_op(self, op: OpSpec) -> None:
-        if op.op_id in self.ops:
-            raise ValueError(f"Duplicate op_id: {op.op_id}")
+    def _require_finalized(self) -> None:
+        if not self._finalized:
+            raise RuntimeError("WorkloadDAG is not finalized. Call finalize() first.")
 
-        for t in op.inputs + op.outputs:
-            if t not in self.tensors:
-                raise KeyError(f"Tensor {t!r} referenced by op {op.op_id!r} is not defined")
+    def add_tensor(self, spec: TensorSpec) -> None:
+        if spec.name in self._tensors:
+            raise ValueError(f"Tensor '{spec.name}' already exists in the DAG.")
+        self._tensors[spec.name] = spec
+        self._invalidate()
 
-        missing_tensor_dims = [t for t in (op.inputs + op.outputs) if t not in op.tensor_dims]
-        if missing_tensor_dims:
-            raise ValueError(
-                f"Op {op.op_id!r} 缺少 tensor_dims 定义: {missing_tensor_dims}"
+    def add_op(self, spec: OpSpec) -> None:
+        if spec.op_id in self._ops:
+            raise ValueError(f"Op '{spec.op_id}' already exists in the DAG.")
+        self._ops[spec.op_id] = spec
+        self._invalidate()
+
+    def add_edge(self, edge: OpDataEdge) -> None:
+        src, dst, tensor = edge.src_op, edge.dst_op, edge.tensor
+        if src not in self._ops:
+            raise ValueError(f"Invalid edge src '{src}': op not found.")
+        if dst not in self._ops:
+            raise ValueError(f"Invalid edge dst '{dst}': op not found.")
+        if tensor not in self._tensors:
+            raise ValueError(f"Edge tensor '{tensor}' not found in DAG.")
+        if tensor not in self._ops[src].outputs:
+            raise ValueError(f"Invalid edge {src} -> {dst}: tensor '{tensor}' is not an output of '{src}'.")
+        if tensor not in self._ops[dst].inputs:
+            raise ValueError(f"Invalid edge {src} -> {dst}: tensor '{tensor}' is not an input of '{dst}'.")
+
+        src_dims_expected = self._ops[src].tensor_dims.get(tensor, ())
+        dst_dims_expected = self._ops[dst].tensor_dims.get(tensor, ())
+        if edge.src_dims and edge.src_dims != src_dims_expected:
+            raise ValueError(f"Invalid edge {src} -> {dst}: src_dims {edge.src_dims} != producer tensor_dims {src_dims_expected}.")
+        if edge.dst_dims and edge.dst_dims != dst_dims_expected:
+            raise ValueError(f"Invalid edge {src} -> {dst}: dst_dims {edge.dst_dims} != consumer tensor_dims {dst_dims_expected}.")
+
+        self._edges.append(
+            OpDataEdge(
+                src_op=src,
+                dst_op=dst,
+                tensor=tensor,
+                src_dims=edge.src_dims or src_dims_expected,
+                dst_dims=edge.dst_dims or dst_dims_expected,
             )
+        )
+        self._invalidate()
 
-        unknown_reduce = set(op.reduce_dims) - set(op.iter_dims)
-        if unknown_reduce:
-            raise ValueError(
-                f"Op {op.op_id!r} reduce_dims must be subset of iter_dims: {sorted(unknown_reduce)}"
-            )
+    def finalize(self) -> None:
+        self._tensor_to_consumer_ops = {name: [] for name in self._tensors}
+        self._tensor_to_producer_op = {name: None for name in self._tensors}
+        self._op_to_input_tensors = {op_id: list(spec.inputs) for op_id, spec in self._ops.items()}
+        self._op_to_output_tensors = {op_id: list(spec.outputs) for op_id, spec in self._ops.items()}
+        self._op_predecessors = {op_id: [] for op_id in self._ops}
+        self._op_successors = {op_id: [] for op_id in self._ops}
 
-        self.ops[op.op_id] = op
+        for op_id, spec in self._ops.items():
+            for t in spec.outputs:
+                if t not in self._tensors:
+                    raise ValueError(f"Op '{op_id}' references unknown output tensor '{t}'.")
+                prev = self._tensor_to_producer_op[t]
+                if prev is not None and prev != op_id:
+                    raise ValueError(f"Tensor '{t}' has multiple producers: '{prev}' and '{op_id}'.")
+                self._tensor_to_producer_op[t] = op_id
+            for t in spec.inputs:
+                if t not in self._tensors:
+                    raise ValueError(f"Op '{op_id}' references unknown input tensor '{t}'.")
+                if op_id not in self._tensor_to_consumer_ops[t]:
+                    self._tensor_to_consumer_ops[t].append(op_id)
 
-    def add_edge(self, edge: EdgeSpec) -> None:
-        if edge.src not in self.ops or edge.dst not in self.ops:
-            raise KeyError(f"Invalid edge endpoints: ({edge.src!r} -> {edge.dst!r})")
-        if edge.tensor not in self.tensors:
-            raise KeyError(f"Invalid edge tensor: {edge.tensor!r}")
+        seen_edges: Set[Tuple[str, str, str]] = set()
+        for edge in self._edges:
+            triple = (edge.src_op, edge.dst_op, edge.tensor)
+            if triple in seen_edges:
+                raise ValueError(f"Duplicate op->op edge: {edge.src_op} -> {edge.dst_op} [tensor={edge.tensor}].")
+            seen_edges.add(triple)
 
-        src_op = self.ops[edge.src]
-        dst_op = self.ops[edge.dst]
+            if edge.dst_op not in self._op_successors[edge.src_op]:
+                self._op_successors[edge.src_op].append(edge.dst_op)
+            if edge.src_op not in self._op_predecessors[edge.dst_op]:
+                self._op_predecessors[edge.dst_op].append(edge.src_op)
 
-        if edge.tensor not in src_op.outputs:
-            raise ValueError(
-                f"Edge tensor {edge.tensor!r} is not an output of producer {edge.src!r}"
-            )
-        if edge.tensor not in dst_op.inputs:
-            raise ValueError(
-                f"Edge tensor {edge.tensor!r} is not an input of consumer {edge.dst!r}"
-            )
+        self._finalized = True
 
-        expected_src_dims = src_op.tensor_dims[edge.tensor]
-        expected_dst_dims = dst_op.tensor_dims[edge.tensor]
+    def tensors(self) -> Dict[str, TensorSpec]:
+        return dict(self._tensors)
 
-        if tuple(edge.src_dims) != tuple(expected_src_dims):
-            raise ValueError(
-                f"Edge ({edge.src}->{edge.dst}) src_dims mismatch: "
-                f"declared={edge.src_dims}, expected={expected_src_dims}"
-            )
-        if tuple(edge.dst_dims) != tuple(expected_dst_dims):
-            raise ValueError(
-                f"Edge ({edge.src}->{edge.dst}) dst_dims mismatch: "
-                f"declared={edge.dst_dims}, expected={expected_dst_dims}"
-            )
+    def ops(self) -> Dict[str, OpSpec]:
+        return dict(self._ops)
 
-        self.edges.append(edge)
+    def edges(self) -> List[OpDataEdge]:
+        return list(self._edges)
 
-    # --------------------------
-    # Basic queries
-    # --------------------------
-
-    def op_ids(self) -> List[str]:
-        return list(self.ops.keys())
-
-    def op_names(self) -> Set[str]:
-        return set(self.ops.keys())
-
-    def get_op(self, op_id: str) -> OpSpec:
-        if op_id not in self.ops:
-            raise KeyError(f"Op {op_id!r} not found")
-        return self.ops[op_id]
+    def tensor(self, name: str) -> TensorSpec:
+        return self._tensors[name]
 
     def op(self, op_id: str) -> OpSpec:
-        return self.get_op(op_id)
+        return self._ops[op_id]
 
-    def get_tensor(self, tensor_name: str) -> TensorSpec:
-        if tensor_name not in self.tensors:
-            raise KeyError(f"Tensor {tensor_name!r} not found")
-        return self.tensors[tensor_name]
-
-    def tensor(self, tensor_name: str) -> TensorSpec:
-        return self.get_tensor(tensor_name)
-
-    def edge_list(self) -> List[EdgeSpec]:
-        return list(self.edges)
-
-    def get_edges_between(self, u: str, v: str) -> List[EdgeSpec]:
-        return [e for e in self.edges if e.src == u and e.dst == v]
-
-    def get_edge(self, u: str, v: str, tensor: Optional[str] = None) -> EdgeSpec:
-        matches = self.get_edges_between(u, v)
-        if tensor is not None:
-            matches = [e for e in matches if e.tensor == tensor]
-
-        if not matches:
-            raise KeyError(f"Edge ({u!r} -> {v!r}, tensor={tensor!r}) not found")
-        if len(matches) > 1 and tensor is None:
-            raise ValueError(
-                f"Multiple edges found for ({u!r} -> {v!r}); please specify tensor"
-            )
-        return matches[0]
-
-    # --------------------------
-    # Compatibility helpers
-    # --------------------------
-
-    def get_edge_tensor_name(self, u: str, v: str, tensor: Optional[str] = None) -> str:
-        return self.get_edge(u, v, tensor=tensor).tensor
-
-    def get_edge_logical_dims(self, u: str, v: str, tensor: Optional[str] = None) -> Tuple[str, ...]:
-        """
-        默认返回 producer 侧逻辑维度。
-        给 fusion / tiling 用。
-        """
-        return self.get_edge(u, v, tensor=tensor).src_dims
-
-    def get_edge_tensor_shape(self, u: str, v: str, tensor: Optional[str] = None) -> Tuple[int, ...]:
-        """
-        返回边上传递张量的数值 shape。
-        给容量估计 / analysis 用。
-        """
-        tname = self.get_edge(u, v, tensor=tensor).tensor
-        return self.tensors[tname].shape
-
-    def get_edge_reduction_dims(self, u: str, v: str, tensor: Optional[str] = None) -> Tuple[str, ...]:
-        edge = self.get_edge(u, v, tensor=tensor)
-        if edge.reduce_dims:
-            return edge.reduce_dims
-        return self.get_op(u).reduce_dims
-
-    # --------------------------
-    # Graph traversal
-    # --------------------------
-
-    def predecessors(self, op_id: str) -> List[str]:
-        return sorted({e.src for e in self.edges if e.dst == op_id})
-
-    def successors(self, op_id: str) -> List[str]:
-        return sorted({e.dst for e in self.edges if e.src == op_id})
-
-    def incoming_edges(self, op_id: str) -> List[EdgeSpec]:
-        return [edge for edge in self.edges if edge.dst == op_id]
-
-    def outgoing_edges(self, op_id: str) -> List[EdgeSpec]:
-        return [edge for edge in self.edges if edge.src == op_id]
-
-    def producer_of(self, tensor_name: str) -> Optional[str]:
-        producers = [op_id for op_id, op in self.ops.items() if tensor_name in op.outputs]
-        if not producers:
-            return None
-        if len(producers) > 1:
-            raise ValueError(f"Tensor {tensor_name!r} has multiple producers: {producers}")
-        return producers[0]
+    def op_ids(self) -> List[str]:
+        return list(self._ops.keys())
 
     def consumers_of(self, tensor_name: str) -> List[str]:
-        return [op_id for op_id, op in self.ops.items() if tensor_name in op.inputs]
+        self._require_finalized()
+        return list(self._tensor_to_consumer_ops.get(tensor_name, []))
 
-    def boundary_tensors(self, op_set: Set[str]) -> Dict[str, Set[str]]:
-        """
-        对任意子图返回：
-        - inputs: 从子图外流入子图内的 tensor
-        - outputs: 从子图内流向子图外的 tensor
-        - temps: 仅在子图内部流动的 tensor
-        - shared: 实际跨子图边界的 tensor
-        """
+    def producer_of(self, tensor_name: str) -> Optional[str]:
+        self._require_finalized()
+        return self._tensor_to_producer_op.get(tensor_name)
+
+    def inputs_of(self, op_id: str) -> List[str]:
+        self._require_finalized()
+        return list(self._op_to_input_tensors.get(op_id, []))
+
+    def outputs_of(self, op_id: str) -> List[str]:
+        self._require_finalized()
+        return list(self._op_to_output_tensors.get(op_id, []))
+
+    def predecessors(self, op_id: str) -> List[str]:
+        self._require_finalized()
+        return list(self._op_predecessors.get(op_id, []))
+
+    def successors(self, op_id: str) -> List[str]:
+        self._require_finalized()
+        return list(self._op_successors.get(op_id, []))
+
+    def edges_between(self, u: str, v: str) -> List[OpDataEdge]:
+        return [e for e in self._edges if e.src_op == u and e.dst_op == v]
+
+    def source_tensors(self) -> List[str]:
+        self._require_finalized()
+        return [n for n, p in self._tensor_to_producer_op.items() if p is None]
+
+    def sink_tensors(self) -> List[str]:
+        self._require_finalized()
+        return [n for n, cs in self._tensor_to_consumer_ops.items() if not cs]
+
+    def topological_op_order(self) -> List[str]:
+        self._require_finalized()
+        in_degree: Dict[str, int] = {op_id: len(self._op_predecessors[op_id]) for op_id in self._ops}
+        queue = deque([op_id for op_id, d in in_degree.items() if d == 0])
+        order: List[str] = []
+        while queue:
+            node = queue.popleft()
+            order.append(node)
+            for dep in self._op_successors[node]:
+                in_degree[dep] -= 1
+                if in_degree[dep] == 0:
+                    queue.append(dep)
+        if len(order) != len(self._ops):
+            raise RuntimeError("Cycle detected in WorkloadDAG.")
+        return order
+
+    def subgraph_tensors(self, op_ids: Set[str]) -> Dict[str, Set[str]]:
+        self._require_finalized()
+        missing = [op_id for op_id in op_ids if op_id not in self._ops]
+        if missing:
+            raise KeyError(f"Unknown ops in subgraph: {missing}")
+
         inputs: Set[str] = set()
         outputs: Set[str] = set()
         temps: Set[str] = set()
-        shared: Set[str] = set()
 
-        for edge in self.edges:
-            u_in = edge.src in op_set
-            v_in = edge.dst in op_set
+        for op_id in op_ids:
+            op = self._ops[op_id]
+            for t in op.inputs:
+                producer = self.producer_of(t)
+                if producer is None or producer not in op_ids:
+                    inputs.add(t)
+                else:
+                    temps.add(t)
 
-            if u_in and v_in:
-                temps.add(edge.tensor)
-            elif (not u_in) and v_in:
-                inputs.add(edge.tensor)
-                shared.add(edge.tensor)
-            elif u_in and (not v_in):
-                outputs.add(edge.tensor)
-                shared.add(edge.tensor)
+            for t in op.outputs:
+                consumers = self.consumers_of(t)
+                if not consumers or any(c not in op_ids for c in consumers):
+                    outputs.add(t)
+                else:
+                    temps.add(t)
 
-        temps -= inputs
-        temps -= outputs
+        temps = temps - inputs - outputs
+        return {"inputs": inputs, "outputs": outputs, "temps": temps}
 
-        return {
-            "inputs": inputs,
-            "outputs": outputs,
-            "temps": temps,
-            "shared": shared,
-        }
+    def is_convex_subgraph(self, op_ids: Set[str]) -> bool:
+        self._require_finalized()
+        if not op_ids:
+            return True
+        missing = [op_id for op_id in op_ids if op_id not in self._ops]
+        if missing:
+            raise KeyError(f"Unknown ops in subgraph: {missing}")
 
-    def topo_order(self) -> List[str]:
-        in_degree = {op_id: 0 for op_id in self.ops}
-        adj: Dict[str, List[str]] = defaultdict(list)
+        outside_frontier: Set[str] = set()
+        queue = deque(op_ids)
+        visited_in = set(op_ids)
 
-        for edge in self.edges:
-            adj[edge.src].append(edge.dst)
-            in_degree[edge.dst] += 1
+        while queue:
+            u = queue.popleft()
+            for v in self._op_successors.get(u, []):
+                if v in op_ids:
+                    if v not in visited_in:
+                        visited_in.add(v)
+                        queue.append(v)
+                else:
+                    outside_frontier.add(v)
 
-        q = deque([op_id for op_id, deg in in_degree.items() if deg == 0])
-        order: List[str] = []
-
-        while q:
-            cur = q.popleft()
-            order.append(cur)
-            for nxt in adj[cur]:
-                in_degree[nxt] -= 1
-                if in_degree[nxt] == 0:
-                    q.append(nxt)
-
-        if len(order) != len(self.ops):
-            raise ValueError("DAG contains a cycle or invalid edge references")
-        return order
-
-    # --------------------------
-    # Validation
-    # --------------------------
+        rev_queue = deque(outside_frontier)
+        visited_out = set(outside_frontier)
+        while rev_queue:
+            u = rev_queue.popleft()
+            for v in self._op_successors.get(u, []):
+                if v in op_ids:
+                    return False
+                if v not in visited_out:
+                    visited_out.add(v)
+                    rev_queue.append(v)
+        return True
 
     def validate(self) -> None:
-        if not self.name:
-            raise ValueError("WorkloadDAG.name must be non-empty")
+        errors: List[str] = []
+        valid_reduce_types = {"full", "partial", "none"}
 
-        if self.spec is not None:
-            self.spec.validate()
+        for op_id, op in self._ops.items():
+            if len(set(op.iter_dims)) != len(op.iter_dims):
+                errors.append(f"Op '{op_id}': iter_dims contains duplicates: {op.iter_dims}.")
+            for t in op.inputs:
+                if t not in self._tensors:
+                    errors.append(f"Op '{op_id}' references unknown input tensor '{t}'.")
+            for t in op.outputs:
+                if t not in self._tensors:
+                    errors.append(f"Op '{op_id}' references unknown output tensor '{t}'.")
+            if op.reduce_type not in valid_reduce_types:
+                errors.append(f"Op '{op_id}': invalid reduce_type '{op.reduce_type}', expected one of {sorted(valid_reduce_types)}.")
+            iter_dims_set = set(op.iter_dims)
+            for rd in op.reduce_dims:
+                if rd not in iter_dims_set:
+                    errors.append(f"Op '{op_id}': reduce_dim '{rd}' is not in iter_dims {op.iter_dims}.")
+            if op.reduce_type == "none" and op.reduce_dims:
+                errors.append(f"Op '{op_id}': reduce_type='none' but reduce_dims={op.reduce_dims} is not empty.")
 
-        if not self.tensors:
-            raise ValueError("WorkloadDAG has no tensors")
-        if not self.ops:
-            raise ValueError("WorkloadDAG has no ops")
+            all_dims = set(op.iter_dims)
+            for t_name, t_dims in op.tensor_dims.items():
+                if len(set(t_dims)) != len(t_dims):
+                    errors.append(f"Op '{op_id}': tensor_dims for '{t_name}' contains duplicates: {t_dims}.")
+                all_dims.update(t_dims)
 
-        for op_id, op in self.ops.items():
-            if not op_id:
-                raise ValueError("Found op with empty op_id")
-            if not op.op_type:
-                raise ValueError(f"Op {op_id!r} has empty op_type")
+            for dim_name, dim_value in op.dim_constraints.items():
+                if dim_name not in all_dims:
+                    errors.append(f"Op '{op_id}': dim_constraint '{dim_name}' not in iter_dims or tensor_dims.")
+                if dim_value <= 0:
+                    errors.append(f"Op '{op_id}': dim_constraint '{dim_name}' must be > 0, got {dim_value}.")
 
-            for t in op.inputs + op.outputs:
-                if t not in self.tensors:
-                    raise KeyError(f"Tensor {t!r} referenced by op {op_id!r} is not defined")
+            for t_name in list(op.inputs) + list(op.outputs):
+                if t_name not in self._tensors:
+                    continue
+                if t_name not in op.tensor_dims:
+                    errors.append(f"Op '{op_id}': tensor_dims missing entry for tensor '{t_name}'.")
+                    continue
+                tensor = self._tensors[t_name]
+                t_dims = op.tensor_dims[t_name]
+                if len(t_dims) != len(tensor.shape):
+                    errors.append(f"Op '{op_id}': tensor '{t_name}' has {len(tensor.shape)} dims but tensor_dims specifies {len(t_dims)}.")
 
-            missing_dims = [t for t in op.inputs + op.outputs if t not in op.tensor_dims]
-            if missing_dims:
-                raise ValueError(f"Op {op_id!r} missing tensor_dims for: {missing_dims}")
+        try:
+            self.finalize()
+            self.topological_op_order()
+        except Exception as e:
+            errors.append(str(e))
 
-            unknown_reduce = set(op.reduce_dims) - set(op.iter_dims)
-            if unknown_reduce:
-                raise ValueError(
-                    f"Op {op_id!r} reduce_dims must be subset of iter_dims: {sorted(unknown_reduce)}"
-                )
+        if errors:
+            self._invalidate()
+            raise ValueError("WorkloadDAG validation failed:\n" + "\n".join(f"  - {e}" for e in errors))
 
-        for edge in self.edges:
-            if edge.src not in self.ops or edge.dst not in self.ops:
-                raise KeyError(f"Invalid edge ({edge.src!r} -> {edge.dst!r}) in WorkloadDAG")
-            if edge.tensor not in self.tensors:
-                raise KeyError(f"Edge tensor {edge.tensor!r} is undefined")
+    def summary(self) -> str:
+        self._require_finalized()
+        lines: List[str] = ["WorkloadDAG summary:"]
+        lines.append(f"  Tensors ({len(self._tensors)}):")
+        for name, t in self._tensors.items():
+            role = t.role.value if isinstance(t.role, Enum) else t.role
+            role_part = f", role={role}" if role is not None else ""
+            lines.append(f"    {name}: shape={t.shape}, type={t.tensor_type.value}, dtype={t.dtype}{role_part}")
 
-        self.topo_order()
+        lines.append(f"  Ops ({len(self._ops)}):")
+        for op_id, op in self._ops.items():
+            lines.append(f"    {op_id}: type={op.op_type}, inputs={list(op.inputs)}, outputs={list(op.outputs)}, reduce_dims={list(op.reduce_dims)}, reduce_type={op.reduce_type}")
+
+        lines.append(f"  Edges ({len(self._edges)}):")
+        for e in self._edges:
+            lines.append(f"    {e.src_op} -> {e.dst_op} [tensor={e.tensor}, src_dims={e.src_dims}, dst_dims={e.dst_dims}]")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return f"WorkloadDAG(tensors={len(self._tensors)}, ops={len(self._ops)}, edges={len(self._edges)}, finalized={self._finalized})"
 
 
-# ============================================================
-# Parameterized Attention DAG builder
-# ============================================================
-
-def build_attention_dag(
-    name: str,
-    batch_size: int,
-    num_heads: int,
-    seq_len: int,
-    d_model: int,
-    phase: str = "prefill",
-    variant: str = "MHA",
-) -> WorkloadDAG:
+def build_attention_dag(spec: AttentionWorkloadSpec) -> WorkloadDAG:
     """
-    显式构建 attention 数据流图。
+    Construct a WorkloadDAG for the given AttentionWorkloadSpec.
+    Supports prefill/decode modes and MHA/GQA/MQA head configurations.
     """
+    dag = WorkloadDAG()
 
-    if batch_size <= 0 or num_heads <= 0 or seq_len <= 0 or d_model <= 0:
-        raise ValueError("batch_size, num_heads, seq_len, d_model must all be > 0")
-    if d_model % num_heads != 0:
-        raise ValueError("d_model must be divisible by num_heads")
+    B = spec.batch_size
+    hq = spec.hq
+    hkv = spec.hkv
+    D = spec.head_dim
+    dtype = spec.dtype
 
-    phase_norm = str(phase).strip()
-    if phase_norm not in {"prefill", "decode"}:
-        raise ValueError(f"Unsupported phase: {phase!r}")
-
-    variant_norm = str(variant).strip().upper()
-    head_dim = d_model // num_heads
-
-    if variant_norm == "MHA":
-        attn_type = "mha"
-        hq = num_heads
-        hkv = num_heads
-        mode = phase_norm
-    elif variant_norm == "GQA":
-        attn_type = "gqa"
-        hq = num_heads
-        hkv = max(1, num_heads // 2)
-        mode = phase_norm
-    elif variant_norm in {"MQA", "MULTIQUERY"}:
-        attn_type = "mqa"
-        hq = num_heads
-        hkv = 1
-        mode = phase_norm
-    elif variant_norm == "DECODE":
-        attn_type = "mha"
-        hq = num_heads
-        hkv = num_heads
-        mode = "decode"
-        phase_norm = "decode"
+    if spec.mode == "prefill":
+        q_len = spec.seq_len
+        kv_len = spec.seq_len
     else:
-        raise ValueError(f"Unsupported variant: {variant!r}")
+        q_len = 1
+        append_len = 1
+        n_cache = spec.cache_len_before
+        kv_len = n_cache + append_len
 
-    spec = AttentionWorkloadSpec(
-        mode=mode,
-        attn_type=attn_type,
-        B=batch_size,
-        Q_len=1 if mode == "decode" else seq_len,
-        KV_len=seq_len,
-        Dh=head_dim,
-        Hq=hq,
-        Hkv=hkv,
-        mask_type="causal",
-        kv_cache_enabled=(mode == "decode"),
-        cache_len_before=(seq_len - 1) if mode == "decode" else None,
-        append_len=1 if mode == "decode" else None,
-    )
-    spec.validate()
+    dag.add_tensor(TensorSpec("Q", (B, hq, q_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.Q))
 
-    dag = WorkloadDAG(name=name, spec=spec)
+    if spec.mode == "prefill":
+        dag.add_tensor(TensorSpec("K_CTX", (B, hkv, kv_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.K))
+        dag.add_tensor(TensorSpec("V_CTX", (B, hkv, kv_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.V))
+    else:
+        dag.add_tensor(TensorSpec("K_CACHE_IN", (B, hkv, n_cache, D), TensorType.CACHE, dtype, role=TensorRole.K))
+        dag.add_tensor(TensorSpec("V_CACHE_IN", (B, hkv, n_cache, D), TensorType.CACHE, dtype, role=TensorRole.V))
+        dag.add_tensor(TensorSpec("K_APPEND", (B, hkv, append_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.K))
+        dag.add_tensor(TensorSpec("V_APPEND", (B, hkv, append_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.V))
+        dag.add_tensor(TensorSpec("K_CACHE_OUT", (B, hkv, kv_len, D), TensorType.CACHE, dtype, role=TensorRole.K))
+        dag.add_tensor(TensorSpec("V_CACHE_OUT", (B, hkv, kv_len, D), TensorType.CACHE, dtype, role=TensorRole.V))
+        dag.add_tensor(TensorSpec("K_CTX", (B, hkv, kv_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.K))
+        dag.add_tensor(TensorSpec("V_CTX", (B, hkv, kv_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.V))
 
-    q_len = spec.Q_len
-    kv_total = spec.KV_total if mode == "decode" else spec.KV_len
+    dag.add_tensor(TensorSpec("K_T", (B, hkv, D, kv_len), TensorType.ACTIVATION, dtype, role=TensorRole.K))
+    dag.add_tensor(TensorSpec("K_T_ATTN", (B, hq, D, kv_len), TensorType.ACTIVATION, dtype, role=TensorRole.K))
+    dag.add_tensor(TensorSpec("V_ATTN", (B, hq, kv_len, D), TensorType.ACTIVATION, dtype, role=TensorRole.V))
+    dag.add_tensor(TensorSpec("SCORES", (B, hq, q_len, kv_len), TensorType.ACTIVATION, dtype, role=TensorRole.SCORES))
+    dag.add_tensor(TensorSpec("STATS", (B, hq, q_len), TensorType.ACTIVATION, dtype, role=TensorRole.STATS))
+    dag.add_tensor(TensorSpec("PROBS", (B, hq, q_len, kv_len), TensorType.ACTIVATION, dtype, role=TensorRole.PROBS))
+    dag.add_tensor(TensorSpec("O", (B, hq, q_len, D), TensorType.OUTPUT, dtype, role=TensorRole.O))
 
-    # --------------------------
-    # Tensors
-    # --------------------------
-    dag.add_tensor(TensorSpec("Q", (batch_size, hq, q_len, head_dim), role="input"))
-    dag.add_tensor(
-        TensorSpec(
-            "K",
-            (batch_size, hkv, kv_total, head_dim),
-            role="state" if mode == "decode" else "input",
-            special_role="KV_CACHE",
-        )
-    )
-    dag.add_tensor(
-        TensorSpec(
-            "V",
-            (batch_size, hkv, kv_total, head_dim),
-            role="state" if mode == "decode" else "input",
-            special_role="KV_CACHE",
-        )
-    )
-    dag.add_tensor(
-        TensorSpec(
-            "SCORES",
-            (batch_size, hq, q_len, kv_total),
-            role="intermediate",
-            special_role="SCORES",
-        )
-    )
-    dag.add_tensor(
-        TensorSpec(
-            "STATS",
-            (batch_size, hq, q_len),
-            role="intermediate",
-            special_role="STATS",
-        )
-    )
-    dag.add_tensor(
-        TensorSpec(
-            "PROBS",
-            (batch_size, hq, q_len, kv_total),
-            role="intermediate",
-            special_role="PROBS",
-        )
-    )
-    dag.add_tensor(
-        TensorSpec(
-            "PARTIAL_O",
-            (batch_size, hq, q_len, head_dim),
-            role="intermediate",
-            special_role="PARTIAL_O",
-        )
-    )
-    dag.add_tensor(TensorSpec("O", (batch_size, hq, q_len, head_dim), role="output"))
-
-    if mode == "decode":
-        dag.add_tensor(TensorSpec("K_APPEND", (batch_size, hkv, 1, head_dim), role="input"))
-        dag.add_tensor(TensorSpec("V_APPEND", (batch_size, hkv, 1, head_dim), role="input"))
-
-    # --------------------------
-    # Ops
-    # --------------------------
-    dag.add_op(
-        OpSpec(
-            op_id="Op_QK",
-            op_type="MatMul",
-            inputs=["Q", "K"],
-            outputs=["SCORES"],
-            iter_dims=("b", "h", "m", "n", "d"),
-            tensor_dims={
-                "Q": ("b", "h", "m", "d"),
-                "K": ("b", "h", "n", "d"),
-                "SCORES": ("b", "h", "m", "n"),
-            },
-            reduce_dims=("d",),
-            phase=phase_norm,
-        )
-    )
-
-    dag.add_op(
-        OpSpec(
-            op_id="Op_Softmax",
-            op_type="Softmax",
-            inputs=["SCORES"],
-            outputs=["STATS", "PROBS"],
-            iter_dims=("b", "h", "m", "n"),
-            tensor_dims={
-                "SCORES": ("b", "h", "m", "n"),
-                "STATS": ("b", "h", "m"),
-                "PROBS": ("b", "h", "m", "n"),
-            },
-            reduce_dims=("n",),
-            phase=phase_norm,
-        )
-    )
-
-    dag.add_op(
-        OpSpec(
-            op_id="Op_AV",
-            op_type="MatMul",
-            inputs=["PROBS", "V"],
-            outputs=["PARTIAL_O"],
-            iter_dims=("b", "h", "m", "n", "d"),
-            tensor_dims={
-                "PROBS": ("b", "h", "m", "n"),
-                "V": ("b", "h", "n", "d"),
-                "PARTIAL_O": ("b", "h", "m", "d"),
-            },
-            reduce_dims=("n",),
-            phase=phase_norm,
-        )
-    )
-
-    dag.add_op(
-        OpSpec(
-            op_id="Op_O",
-            op_type="Identity",
-            inputs=["PARTIAL_O"],
-            outputs=["O"],
-            iter_dims=("b", "h", "m", "d"),
-            tensor_dims={
-                "PARTIAL_O": ("b", "h", "m", "d"),
-                "O": ("b", "h", "m", "d"),
-            },
-            reduce_dims=(),
-            phase=phase_norm,
-        )
-    )
-
-    if mode == "decode":
+    if spec.mode == "decode":
         dag.add_op(
             OpSpec(
                 op_id="Op_K_Append",
                 op_type="KVAppend",
-                inputs=["K_APPEND", "K"],
-                outputs=["K"],
-                iter_dims=("b", "h", "n", "d"),
+                inputs=("K_APPEND", "K_CACHE_IN"),
+                outputs=("K_CACHE_OUT",),
+                iter_dims=("b", "hkv", "n_cache", "n_append", "n_total", "d"),
                 tensor_dims={
-                    "K_APPEND": ("b", "h", "n", "d"),
-                    "K": ("b", "h", "n", "d"),
+                    "K_APPEND": ("b", "hkv", "n_append", "d"),
+                    "K_CACHE_IN": ("b", "hkv", "n_cache", "d"),
+                    "K_CACHE_OUT": ("b", "hkv", "n_total", "d"),
                 },
                 reduce_dims=(),
-                phase=phase_norm,
+                reduce_type="none",
+                attrs={"axis": 2},
+                dim_constraints={"n_cache": n_cache, "n_append": append_len, "n_total": kv_len},
             )
         )
         dag.add_op(
             OpSpec(
                 op_id="Op_V_Append",
                 op_type="KVAppend",
-                inputs=["V_APPEND", "V"],
-                outputs=["V"],
-                iter_dims=("b", "h", "n", "d"),
+                inputs=("V_APPEND", "V_CACHE_IN"),
+                outputs=("V_CACHE_OUT",),
+                iter_dims=("b", "hkv", "n_cache", "n_append", "n_total", "d"),
                 tensor_dims={
-                    "V_APPEND": ("b", "h", "n", "d"),
-                    "V": ("b", "h", "n", "d"),
+                    "V_APPEND": ("b", "hkv", "n_append", "d"),
+                    "V_CACHE_IN": ("b", "hkv", "n_cache", "d"),
+                    "V_CACHE_OUT": ("b", "hkv", "n_total", "d"),
                 },
                 reduce_dims=(),
-                phase=phase_norm,
+                reduce_type="none",
+                attrs={"axis": 2},
+                dim_constraints={"n_cache": n_cache, "n_append": append_len, "n_total": kv_len},
+            )
+        )
+        dag.add_op(
+            OpSpec(
+                op_id="Op_K_CacheView",
+                op_type="Identity",
+                inputs=("K_CACHE_OUT",),
+                outputs=("K_CTX",),
+                iter_dims=("b", "hkv", "n", "d"),
+                tensor_dims={"K_CACHE_OUT": ("b", "hkv", "n", "d"), "K_CTX": ("b", "hkv", "n", "d")},
+                reduce_dims=(),
+                reduce_type="none",
+                attrs={"view_of_cache": True, "alias_ok": True},
+            )
+        )
+        dag.add_op(
+            OpSpec(
+                op_id="Op_V_CacheView",
+                op_type="Identity",
+                inputs=("V_CACHE_OUT",),
+                outputs=("V_CTX",),
+                iter_dims=("b", "hkv", "n", "d"),
+                tensor_dims={"V_CACHE_OUT": ("b", "hkv", "n", "d"), "V_CTX": ("b", "hkv", "n", "d")},
+                reduce_dims=(),
+                reduce_type="none",
+                attrs={"view_of_cache": True, "alias_ok": True},
             )
         )
 
-    # --------------------------
-    # Explicit edges
-    # --------------------------
-    dag.add_edge(
-        EdgeSpec(
-            src="Op_QK",
-            dst="Op_Softmax",
-            tensor="SCORES",
-            src_dims=("b", "h", "m", "n"),
-            dst_dims=("b", "h", "m", "n"),
+    dag.add_op(
+        OpSpec(
+            op_id="Op_K_T",
+            op_type="Transpose",
+            inputs=("K_CTX",),
+            outputs=("K_T",),
+            iter_dims=("b", "hkv", "n", "d"),
+            tensor_dims={"K_CTX": ("b", "hkv", "n", "d"), "K_T": ("b", "hkv", "d", "n")},
             reduce_dims=(),
+            reduce_type="none",
+            attrs={"perm": (0, 1, 3, 2)},
         )
     )
-
-    dag.add_edge(
-        EdgeSpec(
-            src="Op_Softmax",
-            dst="Op_AV",
-            tensor="PROBS",
-            src_dims=("b", "h", "m", "n"),
-            dst_dims=("b", "h", "m", "n"),
+    dag.add_op(
+        OpSpec(
+            op_id="Op_QK",
+            op_type="MatMul",
+            inputs=("Q", "K_T_ATTN"),
+            outputs=("SCORES",),
+            iter_dims=("b", "hq", "m", "n", "d"),
+            tensor_dims={"Q": ("b", "hq", "m", "d"), "K_T_ATTN": ("b", "hq", "d", "n"), "SCORES": ("b", "hq", "m", "n")},
+            reduce_dims=("d",),
+            reduce_type="full",
+            attrs={"transpose_a": False, "transpose_b": False, "attn_type": spec.attn_type},
+        )
+    )
+    dag.add_op(
+        OpSpec(
+            op_id="Op_Softmax",
+            op_type="Softmax",
+            inputs=("SCORES",),
+            outputs=("STATS", "PROBS"),
+            iter_dims=("b", "hq", "m", "n"),
+            tensor_dims={"SCORES": ("b", "hq", "m", "n"), "STATS": ("b", "hq", "m"), "PROBS": ("b", "hq", "m", "n")},
             reduce_dims=("n",),
+            reduce_type="partial",
+            attrs={"axis": -1, "mask_type": spec.mask_type},
+        )
+    )
+    dag.add_op(
+        OpSpec(
+            op_id="Op_AV",
+            op_type="MatMul",
+            inputs=("STATS", "PROBS", "V_ATTN"),
+            outputs=("O",),
+            iter_dims=("b", "hq", "m", "n", "d"),
+            tensor_dims={"STATS": ("b", "hq", "m"), "PROBS": ("b", "hq", "m", "n"), "V_ATTN": ("b", "hq", "n", "d"), "O": ("b", "hq", "m", "d")},
+            reduce_dims=("n",),
+            reduce_type="full",
+            attrs={"transpose_a": False, "transpose_b": False, "attn_type": spec.attn_type},
+        )
+    )
+    dag.add_op(
+        OpSpec(
+            op_id="Op_K_HeadBroadcast",
+            op_type="HeadBroadcast",
+            inputs=("K_T",),
+            outputs=("K_T_ATTN",),
+            iter_dims=("b", "hq", "hkv", "d", "n"),
+            tensor_dims={"K_T": ("b", "hkv", "d", "n"), "K_T_ATTN": ("b", "hq", "d", "n")},
+            reduce_dims=(),
+            reduce_type="none",
+            attrs={"broadcast_axis": "head", "from_heads": hkv, "to_heads": hq, "group_size": spec.kv_head_broadcast, "attn_type": spec.attn_type},
+            dim_constraints={"hq": hq, "hkv": hkv},
+        )
+    )
+    dag.add_op(
+        OpSpec(
+            op_id="Op_V_HeadBroadcast",
+            op_type="HeadBroadcast",
+            inputs=("V_CTX",),
+            outputs=("V_ATTN",),
+            iter_dims=("b", "hq", "hkv", "n", "d"),
+            tensor_dims={"V_CTX": ("b", "hkv", "n", "d"), "V_ATTN": ("b", "hq", "n", "d")},
+            reduce_dims=(),
+            reduce_type="none",
+            attrs={"broadcast_axis": "head", "from_heads": hkv, "to_heads": hq, "group_size": spec.kv_head_broadcast, "attn_type": spec.attn_type},
+            dim_constraints={"hq": hq, "hkv": hkv},
         )
     )
 
-    dag.add_edge(
-        EdgeSpec(
-            src="Op_AV",
-            dst="Op_O",
-            tensor="PARTIAL_O",
-            src_dims=("b", "h", "m", "d"),
-            dst_dims=("b", "h", "m", "d"),
-            reduce_dims=(),
-        )
-    )
+    if spec.mode == "decode":
+        dag.add_edge(OpDataEdge("Op_K_Append", "Op_K_CacheView", "K_CACHE_OUT"))
+        dag.add_edge(OpDataEdge("Op_K_CacheView", "Op_K_T", "K_CTX"))
+        dag.add_edge(OpDataEdge("Op_V_Append", "Op_V_CacheView", "V_CACHE_OUT"))
+        dag.add_edge(OpDataEdge("Op_V_CacheView", "Op_V_HeadBroadcast", "V_CTX"))
+
+    dag.add_edge(OpDataEdge("Op_K_T", "Op_K_HeadBroadcast", "K_T"))
+    dag.add_edge(OpDataEdge("Op_K_HeadBroadcast", "Op_QK", "K_T_ATTN"))
+    dag.add_edge(OpDataEdge("Op_QK", "Op_Softmax", "SCORES"))
+    dag.add_edge(OpDataEdge("Op_Softmax", "Op_AV", "STATS"))
+    dag.add_edge(OpDataEdge("Op_Softmax", "Op_AV", "PROBS"))
+    dag.add_edge(OpDataEdge("Op_V_HeadBroadcast", "Op_AV", "V_ATTN"))
 
     dag.validate()
     return dag
-
-
-__all__ = [
-    "AttentionWorkloadSpec",
-    "TensorSpec",
-    "DomainSpec",
-    "OpSpec",
-    "EdgeSpec",
-    "WorkloadDAG",
-    "build_attention_dag",
-]

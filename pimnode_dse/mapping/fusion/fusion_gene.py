@@ -1,294 +1,254 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, Iterable, List, Optional, Protocol, Set, Tuple
+from dataclasses import dataclass
+from typing import Iterable, Optional, Sequence
 
 
-class FusionStyle(str, Enum):
-    SEQ = "seq"
-    PIPE = "pipe"
+GroupEdge = tuple[str, str]
+GroupEdgeTensor = tuple[str, str, str]
 
 
-@dataclass
-class OpFusionGroup:
+@dataclass(frozen=True)
+class FusionGroup:
+    """Pure structural fusion group.
+
+    This layer only describes which workload ops belong to the same coarse
+    fusion subgraph, plus the boundary tensors derived from workload facts.
+    It does NOT contain placement / tiling / schedule information.
+    """
+
     group_id: str
-    ops: List[str]
-    style: FusionStyle = FusionStyle.SEQ
-    phase: Optional[str] = None
-    role: Optional[str] = None
-    pipe_dim: Optional[str] = None
-    inputs: List[str] = field(default_factory=list)
-    outputs: List[str] = field(default_factory=list)
-    temps: List[str] = field(default_factory=list)
-    in_roles: Dict[str, str] = field(default_factory=dict)
-    out_roles: Dict[str, str] = field(default_factory=dict)
-    shared: List[str] = field(default_factory=list)
+    ops: tuple[str, ...]
+    inputs: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ()
+    temps: tuple[str, ...] = ()
 
-    def __post_init__(self) -> None:
-        self._check_basic_fields()
-        self._check_tensor_partition()
-        self._check_roles()
-
-    @property
-    def op_set(self) -> Set[str]:
+    def op_set(self) -> set[str]:
         return set(self.ops)
 
-    @property
-    def input_set(self) -> Set[str]:
-        return set(self.inputs)
 
-    @property
-    def output_set(self) -> Set[str]:
-        return set(self.outputs)
-
-    @property
-    def temp_set(self) -> Set[str]:
-        return set(self.temps)
-
-    @property
-    def boundary_set(self) -> Set[str]:
-        return self.input_set | self.output_set
-
-    @property
-    def shared_set(self) -> Set[str]:
-        return set(self.shared)
-
-    def _check_basic_fields(self) -> None:
-        if not self.group_id:
-            raise ValueError("group_id 不能为空")
-        if not self.ops:
-            raise ValueError(f"group '{self.group_id}' 的 ops 不能为空")
-        if len(self.ops) != len(set(self.ops)):
-            raise ValueError(f"group '{self.group_id}' 的 ops 存在重复项: {self.ops}")
-        if self.style == FusionStyle.PIPE and not self.pipe_dim:
-            raise ValueError(f"group '{self.group_id}' 为 PIPE 模式时，pipe_dim 不能为空")
-        if self.style == FusionStyle.SEQ and self.pipe_dim is not None:
-            raise ValueError(f"group '{self.group_id}' 为 SEQ 模式时，pipe_dim 必须为 None")
-
-    def _check_tensor_partition(self) -> None:
-        for name, values in {"inputs": self.inputs, "outputs": self.outputs, "temps": self.temps, "shared": self.shared}.items():
-            if len(values) != len(set(values)):
-                raise ValueError(f"group '{self.group_id}' 的 {name} 存在重复项: {values}")
-        io_overlap = self.input_set & self.output_set
-        if io_overlap:
-            raise ValueError(f"group '{self.group_id}' 的张量不能同时属于 inputs 和 outputs: {sorted(io_overlap)}")
-        boundary_temp_overlap = self.boundary_set & self.temp_set
-        if boundary_temp_overlap:
-            raise ValueError(f"group '{self.group_id}' 的张量不能同时属于 boundary 和 temps: {sorted(boundary_temp_overlap)}")
-        illegal_shared = self.shared_set - self.boundary_set
-        if illegal_shared:
-            raise ValueError(f"group '{self.group_id}' 的 shared 必须属于 inputs 或 outputs: {sorted(illegal_shared)}")
-
-    def _check_roles(self) -> None:
-        illegal_in = set(self.in_roles) - self.input_set
-        if illegal_in:
-            raise ValueError(f"group '{self.group_id}' 的 in_roles 只能标注 inputs: {sorted(illegal_in)}")
-        illegal_out = set(self.out_roles) - self.output_set
-        if illegal_out:
-            raise ValueError(f"group '{self.group_id}' 的 out_roles 只能标注 outputs: {sorted(illegal_out)}")
-        empty_in = [k for k, v in self.in_roles.items() if not v]
-        empty_out = [k for k, v in self.out_roles.items() if not v]
-        if empty_in or empty_out:
-            raise ValueError(f"group '{self.group_id}' 的 role 名不能为空: empty_in={empty_in}, empty_out={empty_out}")
-
-
-@dataclass
+@dataclass(frozen=True)
 class FusionGene:
+    """Minimal coarse fusion IR.
+
+    - groups: group-level partition of workload ops
+    - group_edges: coarse DAG edges between groups
+    - group_edges_tensors: tensor-level connections carried by each group edge
+    """
+
     gene_id: str
-    groups: List[OpFusionGroup]
-    edges: List[Tuple[str, str]] = field(default_factory=list)
+    groups: tuple[FusionGroup, ...]
+    group_edges: tuple[GroupEdge, ...] = ()
+    group_edges_tensors: tuple[GroupEdgeTensor, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not self.gene_id:
-            raise ValueError("gene_id 不能为空")
-        if not self.groups:
-            raise ValueError("groups 不能为空")
-        group_ids = [g.group_id for g in self.groups]
-        if len(group_ids) != len(set(group_ids)):
-            raise ValueError(f"FusionGene '{self.gene_id}' 的 group_id 存在重复")
-        self._check_edge_endpoints()
+    def group_ids(self) -> tuple[str, ...]:
+        return tuple(g.group_id for g in self.groups)
 
-    @property
-    def group_map(self) -> Dict[str, OpFusionGroup]:
+    def group_map(self) -> dict[str, FusionGroup]:
         return {g.group_id: g for g in self.groups}
 
-    @property
-    def op_to_group(self) -> Dict[str, str]:
-        mapping: Dict[str, str] = {}
+    def op_to_group(self) -> dict[str, str]:
+        out: dict[str, str] = {}
         for g in self.groups:
             for op in g.ops:
-                if op in mapping:
-                    raise ValueError(f"算子 '{op}' 同时出现在 group '{mapping[op]}' 和 '{g.group_id}' 中")
-                mapping[op] = g.group_id
-        return mapping
+                out[op] = g.group_id
+        return out
 
-    def topo_order(self) -> List[str]:
-        graph = defaultdict(list)
-        indeg = {g.group_id: 0 for g in self.groups}
-        for u, v in self.edges:
-            graph[u].append(v)
-            indeg[v] += 1
-        q = deque([gid for gid, deg in indeg.items() if deg == 0])
-        order: List[str] = []
-        while q:
-            cur = q.popleft()
-            order.append(cur)
-            for nxt in graph[cur]:
-                indeg[nxt] -= 1
-                if indeg[nxt] == 0:
-                    q.append(nxt)
-        if len(order) != len(self.groups):
-            raise ValueError(f"FusionGene '{self.gene_id}' 的 coarse DAG 存在环")
-        return order
+    def tensors_for_edge(self, src_group: str, dst_group: str) -> tuple[str, ...]:
+        tensors = [
+            t
+            for s, d, t in self.group_edges_tensors
+            if s == src_group and d == dst_group
+        ]
+        return tuple(sorted(set(tensors)))
 
-    def predecessors(self, group_id: str) -> Set[str]:
-        return {u for u, v in self.edges if v == group_id}
+    def validate(
+        self,
+        workload_op_ids: Optional[Iterable[str]] = None,
+        graph_adapter: Optional[object] = None,
+    ) -> None:
+        """Validate minimal structural consistency.
 
-    def successors(self, group_id: str) -> Set[str]:
-        return {v for u, v in self.edges if u == group_id}
+        workload_op_ids:
+            Optional complete op-id universe for coverage checking.
 
-    def validate(self, dag: WorkloadDAGProtocol) -> None:
-        self.check_structure(dag)
-        self.check_boundary(dag)
-        self.check_roles(dag)
+        graph_adapter:
+            Optional adapter that provides:
+              - is_convex(op_set) -> bool
+              - boundary(op_set) -> object with inputs/outputs/temps
+        """
 
-    def check_structure(self, dag: WorkloadDAGProtocol) -> None:
-        self._check_coverage(dag)
-        self._check_convex(dag)
-        self._check_edges_match_dag(dag)
-        self.topo_order()
-        self._check_pipe_dims(dag)
+        self._validate_unique_group_ids()
+        self._validate_nonempty_groups()
+        self._validate_disjoint_ops()
+        self._validate_edges_reference_existing_groups()
+        self._validate_edge_tensors_reference_existing_edges()
+        self._validate_group_edges_acyclic()
 
-    def check_boundary(self, dag: WorkloadDAGProtocol) -> None:
-        op_to_group = self.op_to_group
-        cross_group_tensors: Dict[str, Set[str]] = defaultdict(set)
-        for edge in dag.edge_list():
-            src_gid = op_to_group[edge.src]
-            dst_gid = op_to_group[edge.dst]
-            if src_gid == dst_gid:
-                continue
-            cross_group_tensors[src_gid].add(edge.tensor)
-            cross_group_tensors[dst_gid].add(edge.tensor)
+        if workload_op_ids is not None:
+            self._validate_full_coverage(set(workload_op_ids))
 
+        if graph_adapter is not None:
+            self._validate_convexity(graph_adapter)
+            self._validate_boundaries(graph_adapter)
+
+    def _validate_unique_group_ids(self) -> None:
+        ids = [g.group_id for g in self.groups]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate fusion group_id detected.")
+
+    def _validate_nonempty_groups(self) -> None:
         for g in self.groups:
-            real_cross = cross_group_tensors.get(g.group_id, set())
-            illegal_shared = g.shared_set - real_cross
-            if illegal_shared:
-                raise ValueError(f"group '{g.group_id}' 的 shared 不是实际跨 group 张量: {sorted(illegal_shared)}")
-            bad_temps = g.temp_set & real_cross
-            if bad_temps:
-                raise ValueError(f"group '{g.group_id}' 的 temps 中包含真实跨 group 张量: {sorted(bad_temps)}")
+            if not g.ops:
+                raise ValueError(f"Fusion group '{g.group_id}' has no ops.")
 
-    def check_roles(self, dag: WorkloadDAGProtocol) -> None:
-        tensor_roles: Dict[str, str] = {}
+    def _validate_disjoint_ops(self) -> None:
+        seen: dict[str, str] = {}
         for g in self.groups:
-            merged: Dict[str, str] = {}
-            merged.update(g.in_roles)
-            merged.update(g.out_roles)
-            for t, r in merged.items():
-                if t in tensor_roles and tensor_roles[t] != r:
+            for op in g.ops:
+                prev = seen.get(op)
+                if prev is not None:
                     raise ValueError(
-                        f"共享张量 '{t}' 的 role 冲突: 已有 '{tensor_roles[t]}', 新增 '{r}', group='{g.group_id}'"
+                        f"Op '{op}' appears in multiple groups: '{prev}' and '{g.group_id}'."
                     )
-                tensor_roles[t] = r
+                seen[op] = g.group_id
 
-    def _check_edge_endpoints(self) -> None:
-        gids = {g.group_id for g in self.groups}
-        for u, v in self.edges:
-            if u not in gids or v not in gids:
-                raise ValueError(f"FusionGene '{self.gene_id}' 的 edges 包含不存在的 group: {(u, v)}")
-            if u == v:
-                raise ValueError(f"FusionGene '{self.gene_id}' 的 edges 不允许自环: {(u, v)}")
-
-    def _check_coverage(self, dag: WorkloadDAGProtocol) -> None:
-        dag_ops = set(dag.op_names())
-        mapped = set(self.op_to_group)
-        missing = dag_ops - mapped
-        extra = mapped - dag_ops
-        if missing or extra:
-            raise ValueError(f"FusionGene '{self.gene_id}' coverage 检查失败: missing={sorted(missing)}, extra={sorted(extra)}")
-
-    def _check_convex(self, dag: WorkloadDAGProtocol) -> None:
-        reach = _compute_reachability(dag.op_names(), [(e.src, e.dst) for e in dag.edge_list()])
-        for g in self.groups:
-            ops = g.op_set
-            for u in ops:
-                in_group_desc = reach[u] & ops
-                outside = reach[u] - ops
-                for mid in outside:
-                    if reach[mid] & in_group_desc:
-                        raise ValueError(f"group '{g.group_id}' 不是凸子图: 路径包含组外算子 '{mid}'")
-
-    def _check_edges_match_dag(self, dag: WorkloadDAGProtocol) -> None:
-        real_edges = self._build_coarse_edges_from_dag(dag)
-        declared = set(self.edges)
-        if real_edges != declared:
+    def _validate_full_coverage(self, workload_ops: set[str]) -> None:
+        grouped_ops = {op for g in self.groups for op in g.ops}
+        if grouped_ops != workload_ops:
+            missing = sorted(workload_ops - grouped_ops)
+            extra = sorted(grouped_ops - workload_ops)
             raise ValueError(
-                f"FusionGene '{self.gene_id}' 的 coarse edges 与 DAG 不一致: declared={sorted(declared)}, real={sorted(real_edges)}"
+                "Fusion groups do not cover workload ops exactly. "
+                f"missing={missing}, extra={extra}"
             )
 
-    def _build_coarse_edges_from_dag(self, dag: WorkloadDAGProtocol) -> Set[Tuple[str, str]]:
-        op_to_group = self.op_to_group
-        coarse_edges: Set[Tuple[str, str]] = set()
-        for edge in dag.edge_list():
-            gu = op_to_group[edge.src]
-            gv = op_to_group[edge.dst]
-            if gu != gv:
-                coarse_edges.add((gu, gv))
-        return coarse_edges
+    def _validate_edges_reference_existing_groups(self) -> None:
+        valid_ids = set(self.group_ids())
+        for src, dst in self.group_edges:
+            if src not in valid_ids or dst not in valid_ids:
+                raise ValueError(
+                    f"Invalid group edge ({src!r}, {dst!r}); endpoint group not found."
+                )
+            if src == dst:
+                raise ValueError(f"Invalid self-edge on group '{src}'.")
 
-    def _check_pipe_dims(self, dag: WorkloadDAGProtocol) -> None:
+    def _validate_edge_tensors_reference_existing_edges(self) -> None:
+        valid_edges = set(self.group_edges)
+        for src, dst, tensor in self.group_edges_tensors:
+            if (src, dst) not in valid_edges:
+                raise ValueError(
+                    "group_edges_tensors contains a tensor connection whose "
+                    f"group edge is missing: ({src!r}, {dst!r}, {tensor!r})"
+                )
+
+    def _validate_group_edges_acyclic(self) -> None:
+        nodes = set(self.group_ids())
+        succ: dict[str, set[str]] = {n: set() for n in nodes}
+        indeg: dict[str, int] = {n: 0 for n in nodes}
+
+        for src, dst in self.group_edges:
+            if dst not in succ[src]:
+                succ[src].add(dst)
+                indeg[dst] += 1
+
+        ready = sorted([n for n, d in indeg.items() if d == 0])
+        visited = 0
+
+        while ready:
+            node = ready.pop(0)
+            visited += 1
+            for nxt in sorted(succ[node]):
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    ready.append(nxt)
+                    ready.sort()
+
+        if visited != len(nodes):
+            raise ValueError("group_edges must form a DAG.")
+
+    def _validate_convexity(self, graph_adapter: object) -> None:
+        if not hasattr(graph_adapter, "is_convex"):
+            return
         for g in self.groups:
-            if g.style != FusionStyle.PIPE:
+            if not graph_adapter.is_convex(g.op_set()):
+                raise ValueError(
+                    f"Fusion group '{g.group_id}' is not convex in workload DAG."
+                )
+
+    def _validate_boundaries(self, graph_adapter: object) -> None:
+        if not hasattr(graph_adapter, "boundary"):
+            return
+        for g in self.groups:
+            b = graph_adapter.boundary(g.op_set())
+            exp_inputs = tuple(sorted(set(getattr(b, "inputs", ()))))
+            exp_outputs = tuple(sorted(set(getattr(b, "outputs", ()))))
+            exp_temps = tuple(sorted(set(getattr(b, "temps", ()))))
+
+            got_inputs = tuple(sorted(set(g.inputs)))
+            got_outputs = tuple(sorted(set(g.outputs)))
+            got_temps = tuple(sorted(set(g.temps)))
+
+            if got_inputs != exp_inputs:
+                raise ValueError(
+                    f"Fusion group '{g.group_id}' inputs mismatch: "
+                    f"expected={exp_inputs}, got={got_inputs}"
+                )
+            if got_outputs != exp_outputs:
+                raise ValueError(
+                    f"Fusion group '{g.group_id}' outputs mismatch: "
+                    f"expected={exp_outputs}, got={got_outputs}"
+                )
+            if got_temps != exp_temps:
+                raise ValueError(
+                    f"Fusion group '{g.group_id}' temps mismatch: "
+                    f"expected={exp_temps}, got={got_temps}"
+                )
+
+    @classmethod
+    def from_groups(
+        cls,
+        gene_id: str,
+        groups: Sequence[FusionGroup],
+    ) -> "FusionGene":
+        """Build a minimal FusionGene from groups' boundary tensors only.
+
+        Assumptions:
+        - group.outputs and group.inputs have already been derived from workload.
+        - If a tensor is in src.outputs and dst.inputs, it is treated as a
+          cross-group tensor connection.
+        """
+        group_edges_tensors = build_group_edges_tensors(groups)
+        group_edges = build_group_edges(group_edges_tensors)
+        return cls(
+            gene_id=gene_id,
+            groups=tuple(groups),
+            group_edges=group_edges,
+            group_edges_tensors=group_edges_tensors,
+        )
+
+
+def build_group_edges_tensors(
+    groups: Sequence[FusionGroup],
+) -> tuple[GroupEdgeTensor, ...]:
+    """Infer (producer_group, consumer_group, tensor) from group boundaries."""
+    out: list[GroupEdgeTensor] = []
+    for src in groups:
+        src_out = set(src.outputs)
+        if not src_out:
+            continue
+        for dst in groups:
+            if src.group_id == dst.group_id:
                 continue
-            assert g.pipe_dim is not None
-            dims: Set[str] = set()
-            reduce_dims: Set[str] = set()
-            for edge in dag.edge_list():
-                if edge.src in g.op_set and edge.dst in g.op_set:
-                    dims.update(edge.src_dims)
-                    reduce_dims.update(edge.reduce_dims)
-            if g.pipe_dim not in dims:
-                raise ValueError(
-                    f"group '{g.group_id}' 的 pipe_dim='{g.pipe_dim}' 不在组内数据流维度中: {sorted(dims)}"
-                )
-            if g.pipe_dim in reduce_dims:
-                raise ValueError(
-                    f"group '{g.group_id}' 的 pipe_dim='{g.pipe_dim}' 不能直接取 reduction dim: {sorted(reduce_dims)}"
-                )
+            shared = src_out & set(dst.inputs)
+            for tensor in sorted(shared):
+                out.append((src.group_id, dst.group_id, tensor))
+    return tuple(out)
 
 
-class EdgeProtocol(Protocol):
-    src: str
-    dst: str
-    tensor: str
-    src_dims: Tuple[str, ...]
-    dst_dims: Tuple[str, ...]
-    reduce_dims: Tuple[str, ...]
-
-
-class WorkloadDAGProtocol(Protocol):
-    def op_names(self) -> Set[str]: ...
-    def edge_list(self) -> List[EdgeProtocol]: ...
-
-
-def _compute_reachability(op_names: Iterable[str], edges: Iterable[Tuple[str, str]]) -> Dict[str, Set[str]]:
-    op_set = set(op_names)
-    graph: Dict[str, List[str]] = {op: [] for op in op_set}
-    for u, v in edges:
-        graph[u].append(v)
-    reach: Dict[str, Set[str]] = {}
-    for src in op_set:
-        vis = set()
-        q = deque([src])
-        while q:
-            cur = q.popleft()
-            for nxt in graph[cur]:
-                if nxt not in vis:
-                    vis.add(nxt)
-                    q.append(nxt)
-        vis.discard(src)
-        reach[src] = vis
-    return reach
+def build_group_edges(
+    group_edges_tensors: Sequence[GroupEdgeTensor],
+) -> tuple[GroupEdge, ...]:
+    """Collapse tensor-level connections into unique coarse group edges."""
+    edges = sorted({(src, dst) for src, dst, _ in group_edges_tensors})
+    return tuple(edges)

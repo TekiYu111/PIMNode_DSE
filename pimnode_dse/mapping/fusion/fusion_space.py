@@ -1,557 +1,491 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from enum import Enum
-from itertools import combinations
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence, Set
 
-from .fusion_gene import FusionGene, FusionStyle, OpFusionGroup, WorkloadDAGProtocol
+from .fusion_gene import FusionGene, FusionGroup
+from .graph_adapter import WorkloadFusionGraphAdapter
 
-
-# ============================================================
-# workload kind
-# ============================================================
-
-class WorkloadKind(str, Enum):
-    MHA_PREFILL = "mha_prefill"
-    DECODE = "decode"
-    GEMM_LIKE = "gemm_like"
-    UNKNOWN = "unknown"
+try:
+    from .sematic_adapter import WorkloadFusionSemanticAdapter
+except Exception:  # pragma: no cover
+    from .semantic_adapter import WorkloadFusionSemanticAdapter  # type: ignore
 
 
-def infer_workload_kind(dag: WorkloadDAGProtocol) -> WorkloadKind:
-    """
-    根据 workload DAG 的结构与属性推断默认 workload family。
-
-    约定：
-    1. 若存在 Softmax 且 phase/pattern 显示为 prefill，则归为 MHA_PREFILL
-    2. 若存在 Softmax 且 phase/pattern 显示为 decode，则归为 DECODE
-    3. 若不存在 Softmax，且主链以 MatMul / elementwise 为主，则归为 GEMM_LIKE
-    4. 否则回退为 UNKNOWN，并使用较保守默认规则
-    """
-    op_objs = _get_all_ops(dag)
-    op_types = [str(getattr(op, "op_type", "") or "") for op in op_objs]
-    op_names = [str(getattr(op, "name", "") or "") for op in op_objs]
-    phases = [str(getattr(op, "phase", "") or "") for op in op_objs]
-
-    has_softmax = any(t.lower() == "softmax" or "softmax" in n.lower()
-                      for t, n in zip(op_types, op_names))
-
-    # 尝试从 workload / dag 上取 phase
-    dag_phase = str(getattr(dag, "phase", "") or "").lower()
-    phase_tokens = {p.lower() for p in phases if p}
-
-    if has_softmax:
-        if dag_phase == "prefill" or "prefill" in phase_tokens:
-            return WorkloadKind.MHA_PREFILL
-        if dag_phase == "decode" or "decode" in phase_tokens:
-            return WorkloadKind.DECODE
-
-        # 若没显式 phase，则尝试用名字或属性弱判断
-        dag_name = str(getattr(dag, "name", "") or "").lower()
-        if "prefill" in dag_name:
-            return WorkloadKind.MHA_PREFILL
-        if "decode" in dag_name:
-            return WorkloadKind.DECODE
-
-        # attention-like 但未显式写 phase，默认归 prefill
-        return WorkloadKind.MHA_PREFILL
-
-    # 无 softmax 时，若以 MatMul / elementwise 为主，则视作 GEMM-like
-    if op_types:
-        allowed = {"matmul", "identity", "biasadd", "activation", "add", "mul", "gelu", "relu", "norm"}
-        lower_types = {t.lower() for t in op_types if t}
-        if lower_types and lower_types.issubset(allowed):
-            return WorkloadKind.GEMM_LIKE
-
-    return WorkloadKind.UNKNOWN
+class EdgeLike(Protocol):
+    src: str
+    dst: str
 
 
-# ============================================================
-# fusion-space config
-# ============================================================
+class WorkloadDAG(Protocol):
+    def op_names(self) -> Iterable[str]:
+        ...
+
+    def edge_list(self) -> Iterable[EdgeLike]:
+        ...
+
+    def topo_order(self) -> Iterable[str]:
+        ...
+
+    def get_op(self, op_id: str) -> Any:
+        ...
+
+    def successors(self, op_id: str) -> Iterable[str]:
+        ...
+
+    def predecessors(self, op_id: str) -> Iterable[str]:
+        ...
+
+    def boundary_tensors(self, ops: Set[str]) -> Mapping[str, Set[str]]:
+        ...
+
 
 @dataclass(frozen=True)
 class FusionSpaceConfig:
-    """
-    定义 fusion 候选生成规则。
-    它描述的是默认搜索边界，而不是唯一 fusion 策略。
-    """
-    max_group_size: int = 3
-    allow_seq: bool = True
-    allow_pipe: bool = True
-    consecutive_only: bool = True
+    max_depth: int = 6
+    max_front: int = 32
+    max_sig: int = 3
+    max_out: int = 64
+    max_group_ops: int = 4
     allow_cross_phase: bool = False
-
-    # 限制相邻算子类型是否允许进入同一 group
-    allowed_adjacent_type_pairs: Optional[Set[Tuple[str, str]]] = None
-
-    # 为防止第一版直接爆炸
-    max_group_candidates: Optional[int] = 256
-    max_gene_candidates: Optional[int] = 256
+    allow_state_out_mix: bool = False
+    keep_singleton: bool = True
 
 
-def default_fusion_config_for(dag: WorkloadDAGProtocol) -> FusionSpaceConfig:
-    """
-    根据 workload family 选择默认 fusion-space 规则。
-    这是“默认搜索先验”，不是固定 fusion 策略。
-    """
-    kind = infer_workload_kind(dag)
+@dataclass(frozen=True)
+class StateProfile:
+    cross_cnt: int
+    state_cnt: int
+    out_cnt: int
+    bound_cnt: int
+    max_ops: int
+    group_cnt: int
 
-    if kind == WorkloadKind.MHA_PREFILL:
-        return FusionSpaceConfig(
-            max_group_size=3,
-            allow_seq=True,
-            allow_pipe=True,
-            consecutive_only=True,
-            allow_cross_phase=False,
-            allowed_adjacent_type_pairs={
-                ("MatMul", "Softmax"),
-                ("Softmax", "MatMul"),
-                ("MatMul", "Identity"),
-            },
-            max_group_candidates=128,
-            max_gene_candidates=64,
+    def key(self) -> tuple[int, int, int, int, int, int]:
+        return (
+            self.cross_cnt,
+            self.state_cnt,
+            self.out_cnt,
+            self.bound_cnt,
+            self.max_ops,
+            self.group_cnt,
         )
 
-    if kind == WorkloadKind.DECODE:
-        return FusionSpaceConfig(
-            max_group_size=2,
-            allow_seq=True,
-            allow_pipe=False,
-            consecutive_only=True,
-            allow_cross_phase=False,
-            allowed_adjacent_type_pairs={
-                ("MatMul", "Softmax"),
-                ("Softmax", "MatMul"),
-                ("MatMul", "Identity"),
-            },
-            max_group_candidates=96,
-            max_gene_candidates=48,
+    def dominates(self, other: "StateProfile") -> bool:
+        a = self.key()
+        b = other.key()
+        return all(x <= y for x, y in zip(a, b)) and any(x < y for x, y in zip(a, b))
+
+
+@dataclass(frozen=True)
+class StateSig:
+    main_shape: str
+    max_ops: int
+    state_bin: int
+    out_bin: int
+    bound_bin: int
+    group_bin: int
+
+    def key(self) -> tuple[str, int, int, int, int, int]:
+        return (
+            self.main_shape,
+            self.max_ops,
+            self.state_bin,
+            self.out_bin,
+            self.bound_bin,
+            self.group_bin,
         )
 
-    if kind == WorkloadKind.GEMM_LIKE:
-        return FusionSpaceConfig(
-            max_group_size=3,
-            allow_seq=True,
-            allow_pipe=True,
-            consecutive_only=True,
-            allow_cross_phase=False,
-            allowed_adjacent_type_pairs={
-                ("MatMul", "BiasAdd"),
-                ("BiasAdd", "Activation"),
-                ("MatMul", "Activation"),
-                ("MatMul", "Identity"),
-                ("Identity", "Activation"),
-            },
-            max_group_candidates=128,
-            max_gene_candidates=64,
-        )
 
-    # UNKNOWN：较保守
-    return FusionSpaceConfig(
-        max_group_size=2,
-        allow_seq=True,
-        allow_pipe=False,
-        consecutive_only=True,
-        allow_cross_phase=False,
-        allowed_adjacent_type_pairs=None,
-        max_group_candidates=64,
-        max_gene_candidates=32,
-    )
+@dataclass(frozen=True)
+class MergeStep:
+    src_gid: str
+    dst_gid: str
 
 
-# ============================================================
-# helpers
-# ============================================================
+@dataclass(frozen=True)
+class FusionState:
+    gene: FusionGene
+    depth: int
+    profile: StateProfile
+    sig: StateSig
 
-def _get_all_ops(dag: WorkloadDAGProtocol) -> List[object]:
-    """
-    尽量兼容不同 workload 实现。
-    优先读取 dag.ops / dag.op_map，否则尝试 dag.get_op(name)。
-    """
-    if hasattr(dag, "ops"):
-        ops = getattr(dag, "ops")
-        if isinstance(ops, dict):
-            return list(ops.values())
-        if isinstance(ops, list):
-            return list(ops)
+    def key(self) -> tuple[int, int, int, int, int, int]:
+        return self.profile.key()
 
-    if hasattr(dag, "op_map"):
-        op_map = getattr(dag, "op_map")
-        if isinstance(op_map, dict):
-            return list(op_map.values())
-
-    out = []
-    if hasattr(dag, "op_names") and hasattr(dag, "get_op"):
-        for name in dag.op_names():
-            out.append(dag.get_op(name))
-    return out
-
-
-def _get_op(dag: WorkloadDAGProtocol, op_name: str):
-    if hasattr(dag, "get_op"):
-        return dag.get_op(op_name)
-    if hasattr(dag, "ops"):
-        ops = getattr(dag, "ops")
-        if isinstance(ops, dict):
-            return ops[op_name]
-    if hasattr(dag, "op_map"):
-        op_map = getattr(dag, "op_map")
-        if isinstance(op_map, dict):
-            return op_map[op_name]
-    raise KeyError(f"Cannot find op '{op_name}' from workload DAG")
-
-
-def _unique_keep_order(items: Iterable[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def _group_phase(dag: WorkloadDAGProtocol, ops: Sequence[str]) -> Optional[str]:
-    phases = []
-    for op in ops:
-        op_obj = _get_op(dag, op)
-        phase = getattr(op_obj, "phase", None)
-        if phase is not None:
-            phases.append(str(phase))
-    phases = _unique_keep_order(phases)
-    if not phases:
-        return None
-    if len(phases) == 1:
-        return phases[0]
-    return None
-
-
-def _is_convex_subgraph(dag: WorkloadDAGProtocol, ops: Set[str]) -> bool:
-    order = list(dag.op_names())
-    graph: Dict[str, List[str]] = {op: [] for op in order}
-    for u, v in dag.edges:
-        graph[u].append(v)
-
-    def reachable(src: str) -> Set[str]:
-        vis = set()
-        q = [src]
-        while q:
-            cur = q.pop(0)
-            for nxt in graph.get(cur, []):
-                if nxt not in vis:
-                    vis.add(nxt)
-                    q.append(nxt)
-        vis.discard(src)
-        return vis
-
-    reach = {op: reachable(op) for op in order}
-    for u in ops:
-        in_group_desc = reach[u] & ops
-        outside = reach[u] - ops
-        for mid in outside:
-            if reach[mid] & in_group_desc:
-                return False
-    return True
-
-
-def _infer_group_boundary(
-    dag: WorkloadDAGProtocol,
-    ops: Sequence[str],
-) -> Tuple[List[str], List[str], List[str], List[str]]:
-    """
-    返回:
-        inputs, outputs, temps, shared
-    """
-    op_set = set(ops)
-    cross_in: Set[str] = set()
-    cross_out: Set[str] = set()
-    internal_edge_tensors: Set[str] = set()
-
-    for u, v in dag.edges:
-        u_in = u in op_set
-        v_in = v in op_set
-        edge_tensors = list(dag.get_edge_tensors(u, v))
-
-        if u_in and v_in:
-            internal_edge_tensors.update(edge_tensors)
-        elif (not u_in) and v_in:
-            cross_in.update(edge_tensors)
-        elif u_in and (not v_in):
-            cross_out.update(edge_tensors)
-
-    inputs = sorted(cross_in)
-    outputs = sorted(cross_out)
-    temps = sorted(internal_edge_tensors)
-    shared = sorted(cross_in | cross_out)
-
-    return inputs, outputs, temps, shared
-
-
-def _infer_group_roles(
-    dag: WorkloadDAGProtocol,
-    inputs: Sequence[str],
-    outputs: Sequence[str],
-) -> Tuple[Dict[str, str], Dict[str, str]]:
-    in_roles: Dict[str, str] = {}
-    out_roles: Dict[str, str] = {}
-
-    tensor_map = getattr(dag, "tensors", {})
-
-    def role_of(tname: str) -> Optional[str]:
-        t = tensor_map.get(tname)
-        if t is None:
-            return None
-        special = getattr(t, "special_role", None)
-        role = getattr(t, "role", None)
-        if special:
-            return str(special)
-        if role:
-            return str(role).upper()
-        return tname
-
-    for t in inputs:
-        r = role_of(t)
-        if r:
-            in_roles[t] = r
-
-    for t in outputs:
-        r = role_of(t)
-        if r:
-            out_roles[t] = r
-
-    return in_roles, out_roles
-
-
-def _candidate_pipe_dims(dag: WorkloadDAGProtocol, ops: Sequence[str]) -> List[str]:
-    op_set = set(ops)
-    dims: Set[str] = set()
-    reduce_dims: Set[str] = set()
-
-    for u, v in dag.edges:
-        if u in op_set and v in op_set:
-            dims.update(str(x) for x in dag.get_edge_tensor_dims(u, v))
-            red = dag.get_edge_reduction_dim(u, v)
-            if red is not None:
-                reduce_dims.add(str(red))
-
-    return sorted(dims - reduce_dims)
-
-
-# ============================================================
-# FusionSpace
-# ============================================================
 
 @dataclass
 class FusionSpace:
-    dag: WorkloadDAGProtocol
+    dag: WorkloadDAG
     config: FusionSpaceConfig = field(default_factory=FusionSpaceConfig)
+    graph: Optional[WorkloadFusionGraphAdapter] = None
+    semantic: Optional[WorkloadFusionSemanticAdapter] = None
 
-    @classmethod
-    def from_workload(
-        cls,
-        dag: WorkloadDAGProtocol,
-        config: Optional[FusionSpaceConfig] = None,
-    ) -> "FusionSpace":
-        """
-        默认入口：
-        - 若不给 config，则自动基于 workload family 选择默认规则
-        - 若给 config，则保留消融实验/手工控制入口
-        """
-        if config is None:
-            config = default_fusion_config_for(dag)
-        return cls(dag=dag, config=config)
+    def __post_init__(self) -> None:
+        if self.graph is None:
+            self.graph = WorkloadFusionGraphAdapter(self.dag)
+        if self.semantic is None:
+            self.semantic = WorkloadFusionSemanticAdapter(self.dag)
+        self._topo_cache: Optional[tuple[str, ...]] = None
+        self._topo_pos: dict[str, int] = {}
+        self._succ_cache: Optional[dict[str, tuple[str, ...]]] = None
 
-    def enumerate_groups(self) -> List[OpFusionGroup]:
-        topo = list(self.dag.topo_order()) if hasattr(self.dag, "topo_order") else list(self.dag.op_names())
-        out: List[OpFusionGroup] = []
+    def enumerate_genes(self) -> list[FusionGene]:
+        seeds = [self.init_state()]
+        done: list[FusionState] = []
+        seen = {self._state_id(seeds[0].gene)}
 
-        for size in range(1, self.config.max_group_size + 1):
-            if self.config.consecutive_only:
-                for i in range(0, len(topo) - size + 1):
-                    ops = topo[i:i + size]
-                    out.extend(self._build_groups_for_ops(ops))
-            else:
-                for ops in combinations(topo, size):
-                    out.extend(self._build_groups_for_ops(list(ops)))
-
-            if self.config.max_group_candidates is not None and len(out) >= self.config.max_group_candidates:
-                return out[: self.config.max_group_candidates]
-
-        return out
-
-    def _build_groups_for_ops(self, ops: Sequence[str]) -> List[OpFusionGroup]:
-        op_set = set(ops)
-
-        if not _is_convex_subgraph(self.dag, op_set):
-            return []
-
-        phase = _group_phase(self.dag, ops)
-        if (phase is None) and (not self.config.allow_cross_phase):
-            phases = []
-            for op in ops:
-                op_obj = _get_op(self.dag, op)
-                p = getattr(op_obj, "phase", None)
-                if p is not None:
-                    phases.append(str(p))
-            phases = _unique_keep_order(phases)
-            if len(phases) > 1:
-                return []
-
-        if not self._adjacent_type_rule_ok(ops):
-            return []
-
-        inputs, outputs, temps, shared = _infer_group_boundary(self.dag, ops)
-        in_roles, out_roles = _infer_group_roles(self.dag, inputs, outputs)
-
-        built: List[OpFusionGroup] = []
-        gid_base = "__".join(ops)
-
-        if self.config.allow_seq:
-            try:
-                built.append(
-                    OpFusionGroup(
-                        group_id=f"g_seq_{gid_base}",
-                        ops=list(ops),
-                        style=FusionStyle.SEQ,
-                        phase=phase,
-                        inputs=inputs,
-                        outputs=outputs,
-                        temps=temps,
-                        in_roles=in_roles,
-                        out_roles=out_roles,
-                        shared=shared,
-                    )
-                )
-            except Exception:
-                pass
-
-        if self.config.allow_pipe and len(ops) > 1:
-            for pipe_dim in _candidate_pipe_dims(self.dag, ops):
-                try:
-                    built.append(
-                        OpFusionGroup(
-                            group_id=f"g_pipe_{gid_base}_{pipe_dim}",
-                            ops=list(ops),
-                            style=FusionStyle.PIPE,
-                            phase=phase,
-                            pipe_dim=pipe_dim,
-                            inputs=inputs,
-                            outputs=outputs,
-                            temps=temps,
-                            in_roles=in_roles,
-                            out_roles=out_roles,
-                            shared=shared,
-                        )
-                    )
-                except Exception:
+        front = self._prune_states(seeds)
+        for _ in range(self.config.max_depth):
+            next_states: list[FusionState] = []
+            grew = False
+            for state in front:
+                merges = self.list_merges(state)
+                if not merges:
+                    done.append(state)
                     continue
+                for step in merges:
+                    child = self.apply_merge(state, step)
+                    if child is None:
+                        continue
+                    sid = self._state_id(child.gene)
+                    if sid in seen:
+                        continue
+                    seen.add(sid)
+                    next_states.append(child)
+                    grew = True
+            if not grew:
+                done.extend(front)
+                break
+            front = self._prune_states(next_states)
+            if not front:
+                break
+        else:
+            done.extend(front)
 
-        return built
+        genes: list[FusionGene] = []
+        out_seen: set[str] = set()
+        init_gene = seeds[0].gene
+        if self.config.keep_singleton:
+            out_seen.add(init_gene.gene_id)
+            genes.append(init_gene)
 
-    def _adjacent_type_rule_ok(self, ops: Sequence[str]) -> bool:
-        rules = self.config.allowed_adjacent_type_pairs
-        if not rules or len(ops) <= 1:
-            return True
-
-        for a, b in zip(ops[:-1], ops[1:]):
-            op_a = _get_op(self.dag, a)
-            op_b = _get_op(self.dag, b)
-            type_a = getattr(op_a, "op_type", None)
-            type_b = getattr(op_b, "op_type", None)
-            if (type_a, type_b) not in rules:
-                return False
-        return True
-
-    def enumerate_genes(self) -> List[FusionGene]:
-        groups = self.enumerate_groups()
-        dag_ops = set(self.dag.op_names())
-
-        by_first_op: Dict[str, List[OpFusionGroup]] = {}
-        for g in groups:
-            first = g.ops[0]
-            by_first_op.setdefault(first, []).append(g)
-
-        topo = list(self.dag.topo_order()) if hasattr(self.dag, "topo_order") else sorted(dag_ops)
-        genes: List[FusionGene] = []
-
-        def backtrack(idx: int, chosen: List[OpFusionGroup], covered: Set[str]) -> None:
-            if self.config.max_gene_candidates is not None and len(genes) >= self.config.max_gene_candidates:
-                return
-
-            if covered == dag_ops:
-                gene = self._build_gene(chosen)
-                if gene is not None:
-                    genes.append(gene)
-                return
-
-            next_op = None
-            while idx < len(topo):
-                if topo[idx] not in covered:
-                    next_op = topo[idx]
-                    break
-                idx += 1
-
-            if next_op is None:
-                return
-
-            for g in by_first_op.get(next_op, []):
-                g_ops = set(g.ops)
-                if g_ops & covered:
-                    continue
-                chosen.append(g)
-                backtrack(idx + 1, chosen, covered | g_ops)
-                chosen.pop()
-
-        backtrack(0, [], set())
+        for state in sorted(done, key=lambda item: item.key()):
+            gene = state.gene
+            if gene.gene_id in out_seen:
+                continue
+            out_seen.add(gene.gene_id)
+            genes.append(gene)
+            if len(genes) >= self.config.max_out:
+                break
         return genes
 
-    def _build_gene(self, groups: Sequence[OpFusionGroup]) -> Optional[FusionGene]:
-        op_to_gid: Dict[str, str] = {}
-        for g in groups:
-            for op in g.ops:
-                if op in op_to_gid:
-                    return None
-                op_to_gid[op] = g.group_id
+    def enumerate_groups(self) -> list[FusionGroup]:
+        seen: set[str] = set()
+        out: list[FusionGroup] = []
+        for gene in self.enumerate_genes():
+            for group in gene.groups:
+                if group.group_id in seen:
+                    continue
+                seen.add(group.group_id)
+                out.append(group)
+        return out
 
-        coarse_edges: Set[Tuple[str, str]] = set()
-        for u, v in self.dag.edges:
-            gu = op_to_gid[u]
-            gv = op_to_gid[v]
-            if gu != gv:
-                coarse_edges.add((gu, gv))
+    def init_state(self) -> FusionState:
+        parts = [[op] for op in self._topo()]
+        gene = self._make_gene(parts, tag="init")
+        profile = self.build_profile(gene)
+        sig = self.build_sig(gene, profile)
+        return FusionState(gene=gene, depth=0, profile=profile, sig=sig)
 
-        ordered = sorted(groups, key=lambda x: x.group_id)
-        gene_id = "gene__" + "__".join(g.group_id for g in ordered)
+    def list_merges(self, state: FusionState) -> list[MergeStep]:
+        groups = self._group_map(state.gene)
+        out: list[MergeStep] = []
+        for src_gid, dst_gid in self._gene_edges(state.gene):
+            src = groups.get(src_gid)
+            dst = groups.get(dst_gid)
+            if src is None or dst is None:
+                continue
+            if not self._can_merge(src, dst):
+                continue
+            out.append(MergeStep(src_gid=src_gid, dst_gid=dst_gid))
+        return out
 
-        try:
-            gene = FusionGene(
-                gene_id=gene_id,
-                groups=list(ordered),
-                edges=sorted(coarse_edges),
-            )
-            gene.validate(self.dag)
-            return gene
-        except Exception:
+    def apply_merge(self, state: FusionState, step: MergeStep) -> Optional[FusionState]:
+        groups = self._group_map(state.gene)
+        src = groups.get(step.src_gid)
+        dst = groups.get(step.dst_gid)
+        if src is None or dst is None:
             return None
 
+        merged_ops = sorted(
+            set(src.ops) | set(dst.ops),
+            key=self._topo_index,
+        )
 
-def enumerate_fusion_candidates(
-    dag: WorkloadDAGProtocol,
-    config: Optional[FusionSpaceConfig] = None,
-) -> List[FusionGene]:
-    """
-    函数式快捷入口。
-    """
-    return FusionSpace.from_workload(dag, config=config).enumerate_genes()
+        parts: list[list[str]] = []
+        merged_added = False
+        for group in state.gene.groups:
+            if group.group_id in {step.src_gid, step.dst_gid}:
+                if not merged_added:
+                    parts.append(list(merged_ops))
+                    merged_added = True
+                continue
+            parts.append(list(group.ops))
+        if not merged_added:
+            return None
+
+        gene = self._make_gene(parts, tag=f"m{state.depth + 1}")
+        profile = self.build_profile(gene)
+        sig = self.build_sig(gene, profile)
+        return FusionState(gene=gene, depth=state.depth + 1, profile=profile, sig=sig)
+
+    def build_profile(self, gene: FusionGene) -> StateProfile:
+        cross_cnt = 0
+        state_cnt = 0
+        out_cnt = 0
+        for src_gid, dst_gid, tensor in gene.group_edges_tensors:
+            if src_gid == dst_gid:
+                continue
+            cross_cnt += 1
+            cat = self._tensor_category(tensor)
+            if cat == "state":
+                state_cnt += 1
+            if cat == "output":
+                out_cnt += 1
+
+        bound_cnt = 0
+        max_ops = 0
+        for group in gene.groups:
+            max_ops = max(max_ops, len(group.ops))
+            bound_cnt += len(group.inputs) + len(group.outputs)
+
+        return StateProfile(
+            cross_cnt=cross_cnt,
+            state_cnt=state_cnt,
+            out_cnt=out_cnt,
+            bound_cnt=bound_cnt,
+            max_ops=max_ops,
+            group_cnt=len(gene.groups),
+        )
+
+    def build_sig(self, gene: FusionGene, profile: StateProfile) -> StateSig:
+        return StateSig(
+            main_shape=self._main_shape(gene),
+            max_ops=min(profile.max_ops, self.config.max_group_ops),
+            state_bin=min(profile.state_cnt, 2),
+            out_bin=min(profile.out_cnt, 2),
+            bound_bin=min(profile.bound_cnt // 4, 3),
+            group_bin=min(profile.group_cnt, 7),
+        )
+
+    def prune_states(self, states: Sequence[FusionState]) -> list[FusionState]:
+        return self._prune_states(states)
+
+    def _prune_states(self, states: Sequence[FusionState]) -> list[FusionState]:
+        buckets: dict[tuple[str, int, int, int, int, int], list[FusionState]] = defaultdict(list)
+        for state in states:
+            buckets[state.sig.key()].append(state)
+
+        kept: list[FusionState] = []
+        for bucket in buckets.values():
+            pareto = self._pareto_keep(bucket)
+            pareto.sort(key=lambda item: item.key())
+            kept.extend(pareto[: self.config.max_sig])
+
+        kept.sort(key=lambda item: item.key())
+        return kept[: self.config.max_front]
+
+    def _pareto_keep(self, states: Sequence[FusionState]) -> list[FusionState]:
+        out: list[FusionState] = []
+        for cand in states:
+            drop = False
+            next_out: list[FusionState] = []
+            for cur in out:
+                if cur.profile.dominates(cand.profile):
+                    drop = True
+                    next_out.append(cur)
+                    continue
+                if cand.profile.dominates(cur.profile):
+                    continue
+                next_out.append(cur)
+            if not drop:
+                next_out.append(cand)
+            out = next_out
+        return out
+
+    def _can_merge(self, src: FusionGroup, dst: FusionGroup) -> bool:
+        merged = set(src.ops) | set(dst.ops)
+        if len(merged) > self.config.max_group_ops:
+            return False
+        if not self._is_convex(merged):
+            return False
+        if not self._phase_ok(merged):
+            return False
+        if not self._boundary_ok(merged):
+            return False
+        return True
+
+    def _phase_ok(self, ops: Set[str]) -> bool:
+        if self.config.allow_cross_phase:
+            return True
+        vals = {self.semantic.op_phase(op) for op in ops if self.semantic.op_phase(op) not in {"", "unknown", None}}
+        return len(vals) <= 1
+
+    def _boundary_ok(self, ops: Set[str]) -> bool:
+        if self.config.allow_state_out_mix:
+            return True
+        bound = self.graph.boundary(ops)
+        seen_state = False
+        seen_out = False
+        for tensor in bound.outputs:
+            cat = self._tensor_category(tensor)
+            if cat == "state":
+                seen_state = True
+            if cat == "output":
+                seen_out = True
+        return not (seen_state and seen_out)
+
+    def _is_convex(self, ops: Set[str]) -> bool:
+        try:
+            return bool(self.graph.is_convex(ops))
+        except Exception:
+            return self._is_convex_fallback(ops)
+
+    def _is_convex_fallback(self, ops: Set[str]) -> bool:
+        for src in ops:
+            reach_in = self._reach(src, stop=None)
+            inner = reach_in & ops
+            outer = reach_in - ops
+            for mid in outer:
+                if self._reach(mid, stop=ops) & inner:
+                    return False
+        return True
+
+    def _reach(self, src: str, stop: Optional[Set[str]]) -> set[str]:
+        seen: set[str] = set()
+        queue: deque[str] = deque([src])
+        succ = self._succ_map()
+        while queue:
+            cur = queue.popleft()
+            for nxt in succ.get(cur, ()): 
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                if stop is not None and nxt in stop:
+                    continue
+                queue.append(nxt)
+        seen.discard(src)
+        return seen
+
+    def _main_shape(self, gene: FusionGene) -> str:
+        chain = self._main_chain()
+        if not chain:
+            return "none"
+
+        op_to_gid = gene.op_to_group()
+        groups = self._group_map(gene)
+        seen: set[str] = set()
+        parts: list[str] = []
+        for op in chain:
+            gid = op_to_gid.get(op)
+            if gid is None or gid in seen:
+                continue
+            seen.add(gid)
+            group = groups[gid]
+            kinds = [self.semantic.op_kind(name) for name in group.ops if name in chain]
+            if kinds:
+                parts.append(f"[{'-'.join(kinds)}]")
+        return "".join(parts) if parts else "none"
+
+    def _main_chain(self) -> tuple[str, ...]:
+        topo = self._topo()
+        qk = self._find_first(topo, "qk")
+        if qk is None:
+            return tuple()
+        softmax = self._find_succ(qk, "softmax")
+        if softmax is None:
+            return (qk,)
+        av = self._find_succ(softmax, "av")
+        if av is None:
+            return (qk, softmax)
+        return (qk, softmax, av)
+
+    def _find_first(self, topo: Sequence[str], kind: str) -> Optional[str]:
+        for op in topo:
+            if self.semantic.op_kind(op) == kind:
+                return op
+        return None
+
+    def _find_succ(self, op: str, kind: str) -> Optional[str]:
+        hits = [name for name in self.graph.successors(op) if self.semantic.op_kind(name) == kind]
+        if len(hits) == 1:
+            return hits[0]
+        return None
+
+    def _make_gene(self, parts: Sequence[Sequence[str]], tag: str) -> FusionGene:
+        groups = tuple(self._make_group(idx, ops) for idx, ops in enumerate(parts))
+        gene_id = self._gene_id(groups, tag)
+        return FusionGene.from_groups(gene_id=gene_id, groups=groups)
+
+    def _make_group(self, idx: int, ops: Sequence[str]) -> FusionGroup:
+        op_ids = tuple(sorted(set(ops), key=self._topo_index))
+        bound = self.graph.boundary(set(op_ids))
+        return FusionGroup(
+            group_id=f"g{idx}",
+            ops=op_ids,
+            inputs=tuple(sorted(bound.inputs)),
+            outputs=tuple(sorted(bound.outputs)),
+            temps=tuple(sorted(bound.temps)),
+        )
+
+    def _gene_id(self, groups: Sequence[FusionGroup], tag: str) -> str:
+        body = "__".join("-".join(group.ops) for group in groups)
+        return f"gene__{tag}__{body}"
+
+    def _state_id(self, gene: FusionGene) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        rows = [(group.group_id, tuple(group.ops)) for group in gene.groups]
+        return tuple(sorted(rows))
+
+    @staticmethod
+    def _group_map(gene: FusionGene) -> dict[str, FusionGroup]:
+        return {group.group_id: group for group in gene.groups}
+
+    @staticmethod
+    def _gene_edges(gene: FusionGene) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(set(gene.group_edges)))
+
+    def _topo(self) -> tuple[str, ...]:
+        if self._topo_cache is None:
+            topo = tuple(self.graph.topo_order())
+            if not topo:
+                topo = tuple(sorted(self.graph.op_names()))
+            self._topo_cache = topo
+            self._topo_pos = {op: idx for idx, op in enumerate(topo)}
+        return self._topo_cache
+
+    def _topo_index(self, op: str) -> int:
+        self._topo()
+        return self._topo_pos.get(op, len(self._topo_pos))
+
+    def _tensor_category(self, tensor: str) -> str:
+        return self.semantic.tensor_category(tensor)
+
+    def _succ_map(self) -> dict[str, tuple[str, ...]]:
+        if self._succ_cache is None:
+            out: dict[str, list[str]] = defaultdict(list)
+            for edge in self.graph.edges():
+                out[edge.src_op].append(edge.dst_op)
+            self._succ_cache = {key: tuple(val) for key, val in out.items()}
+        return self._succ_cache
 
 
 __all__ = [
-    "WorkloadKind",
-    "infer_workload_kind",
     "FusionSpaceConfig",
-    "default_fusion_config_for",
+    "StateProfile",
+    "StateSig",
+    "MergeStep",
+    "FusionState",
     "FusionSpace",
-    "enumerate_fusion_candidates",
 ]

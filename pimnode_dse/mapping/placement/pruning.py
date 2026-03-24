@@ -1,116 +1,127 @@
-# placement/pruning.py
+from __future__ import annotations
 
-from typing import List
-from pimnode_dse.placement.placement_ir import PlacementPlan, PlacementScope, ResidentSet
-from pimnode_dse.placement.rules import derive_actions
-from copy import deepcopy
+from dataclasses import dataclass
+from typing import Sequence
 
-# -------------------------------
-# 可行性剪枝
-# -------------------------------
-def feasibility_prune(plan: PlacementPlan, sram_capacity: int, dram_bank_count: int, phase: str) -> PlacementPlan:
+from pimnode_dse.mapping.placement.node import GroupDP
+from pimnode_dse.mapping.placement.placement import GroupCtx
+from pimnode_dse.mapping.placement.rules import dp_key, legal_dp
+
+
+@dataclass(frozen=True)
+class DpStat:
+    nodes: int
+    levels: int
+    sig: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "nodes": self.nodes,
+            "levels": self.levels,
+            "sig": self.sig,
+        }
+
+
+# -----------------------------
+# public
+# -----------------------------
+
+def stat_dp(dp: GroupDP) -> DpStat:
+    return DpStat(
+        nodes=len(dp.nodes),
+        levels=len({node.level for node in dp.nodes}),
+        sig=len(dp_key(dp)),
+    )
+
+
+
+def prune_bad(dps: Sequence[GroupDP], ctx: GroupCtx) -> tuple[GroupDP, ...]:
+    return tuple(dp for dp in dps if legal_dp(dp, ctx))
+
+
+
+def prune_dup(dps: Sequence[GroupDP]) -> tuple[GroupDP, ...]:
+    keep: dict[tuple[tuple[object, ...], ...], GroupDP] = {}
+    for dp in dps:
+        key = dp_key(dp)
+        if key not in keep:
+            keep[key] = dp
+    return tuple(keep.values())
+
+
+
+def prune_eq(dps: Sequence[GroupDP]) -> tuple[GroupDP, ...]:
+    """Drop structurally equivalent candidates after level/slot normalization.
+
+    This is not heuristic pruning. Two candidates are equivalent only when they
+    induce the same normalized storage structure.
     """
-    Remove templates that violate hard memory constraints:
-    - SRAM resident tensor count <= sram_capacity
-    - DRAM parallel access <= dram_bank_count
-    - Phase-specific constraints can be applied
-    Returns a new PlacementPlan with feasible scopes only
+    keep: dict[tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...], GroupDP] = {}
+    for dp in dps:
+        key = _eq_key(dp)
+        if key not in keep:
+            keep[key] = dp
+    return tuple(keep.values())
+
+
+
+def prune_dom(dps: Sequence[GroupDP], ctx: GroupCtx | None = None) -> tuple[GroupDP, ...]:
+    """No dominance pruning without a proven dominance relation.
+
+    TCM prunes with proofs derived from dataplacement/dataflow/tile-shape
+    structure. Until such proofs exist here, this step must stay lossless.
     """
-    new_plan = PlacementPlan(scopes={})
-    for scope_name, scope in plan.scopes.items():
-        feasible = True
+    return tuple(dps)
 
-        # SRAM容量检查
-        for rs in scope.resident_sets:
-            if rs.mem == "SRAM" and len(rs.tensors) > sram_capacity:
-                feasible = False
-                break
 
-        # DRAM bank 检查（粗略：如果 resident tensor 数超过 bank 数）
-        if feasible:
-            for rs in scope.resident_sets:
-                if rs.mem == "DRAM" and len(rs.tensors) > dram_bank_count:
-                    feasible = False
-                    break
 
-        # 可加入 phase-specific constraints
-        # (这里保留接口，可按需要扩展)
+def sort_dp(dps: Sequence[GroupDP]) -> tuple[GroupDP, ...]:
+    return tuple(sorted(dps, key=_sort_key))
 
-        if feasible:
-            new_plan.add_scope(deepcopy(scope))
 
-    return new_plan
 
-# -------------------------------
-# 支配剪枝
-# -------------------------------
-def dominance_prune(plans: List[PlacementPlan], compute_metric_fn) -> List[PlacementPlan]:
-    """
-    Remove dominated PlacementPlan templates.
-    - compute_metric_fn: function(plan) -> dict with keys:
-        'data_movement_bytes', 'dram_access_bytes', 'compute_cycles', 'energy'
-    """
-    survivors = []
-    metrics_cache = {}
+def prune_dp(dps: Sequence[GroupDP], ctx: GroupCtx, top: int | None = None) -> tuple[GroupDP, ...]:
+    out = tuple(dps)
+    out = prune_bad(out, ctx)
+    out = prune_dup(out)
+    out = prune_eq(out)
+    out = prune_dom(out, ctx)
+    out = sort_dp(out)
+    if top is not None:
+        out = out[: max(0, top)]
+    return out
 
-    # 先计算每个模板指标
-    for plan in plans:
-        metrics_cache[id(plan)] = compute_metric_fn(plan)
 
-    for i, plan_i in enumerate(plans):
-        dominated = False
-        for j, plan_j in enumerate(plans):
-            if i == j:
-                continue
-            mi = metrics_cache[id(plan_i)]
-            mj = metrics_cache[id(plan_j)]
-            # 支配条件示例：数据搬运量和 compute cycles
-            if (mi['data_movement_bytes'] >= mj['data_movement_bytes'] and
-                mi['compute_cycles'] >= mj['compute_cycles']):
-                # 再加 DRAM访问次数和能耗判定
-                if (mi['dram_access_bytes'] >= mj['dram_access_bytes'] and
-                    mi['energy'] >= mj['energy']):
-                    dominated = True
-                    break
-        if not dominated:
-            survivors.append(plan_i)
 
-    return survivors
+def explain_score(dp: GroupDP, ctx: GroupCtx | None = None) -> dict[str, int]:
+    return stat_dp(dp).as_dict()
 
-# -------------------------------
-# Example compute_metric_fn
-# -------------------------------
-def example_metric_fn(plan: PlacementPlan):
-    """
-    Simple example metric function
-    Count resident tensor sizes as data movement
-    Assume 1 tensor unit = 1 byte (示例)
-    """
-    data_movement = 0
-    dram_access = 0
-    compute_cycles = 0
-    energy = 0
 
-    for scope_name, scope in plan.scopes.items():
-        # 遍历 ResidentSet
-        for rs in scope.resident_sets:
-            data_movement += len(rs.tensors)
-            if rs.mem == "DRAM":
-                dram_access += len(rs.tensors)
-        # 遍历 BoundaryAction (writeback/evict)
-        for ba in scope.boundary_actions:
-            data_movement += len(ba.writeback) + len(ba.evict)
-            dram_access += len(ba.writeback)
-        # PE 计算简单假设
-        for rs in scope.resident_sets:
-            if rs.mem == "PE":
-                compute_cycles += len(rs.tensors)  # 假设每tensor1 cycle
-        # Energy 粗略估算
-        energy = data_movement + compute_cycles  # 仅示例
+# -----------------------------
+# helpers
+# -----------------------------
 
-    return {
-        'data_movement_bytes': data_movement,
-        'dram_access_bytes': dram_access,
-        'compute_cycles': compute_cycles,
-        'energy': energy
-    }
+def _eq_key(dp: GroupDP) -> tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...]:
+    return tuple(
+        (node.level, node.kind, node.tensors, node.axis)
+        for node in dp.nodes
+    )
+
+
+
+def _sort_key(dp: GroupDP) -> tuple[object, ...]:
+    stat = stat_dp(dp)
+    level_rank = {"pe": 0, "sram": 1, "dram": 2}
+    kind_rank = {"acc": 0, "state": 1, "hold": 2, "flow": 3}
+    node_sig = tuple(
+        (
+            level_rank.get(node.level, 9),
+            kind_rank.get(node.kind, 9),
+            node.slot,
+            node.tensors,
+            node.axis,
+            node.id,
+        )
+        for node in dp.nodes
+    )
+    return (stat.nodes, stat.levels, node_sig, dp.group)

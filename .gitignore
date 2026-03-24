@@ -1,0 +1,48 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# env
+.env
+.env.*
+
+# editor
+.vscode/
+.idea/
+
+# claude
+.claude/
+.claude.json
+
+# system
+.DS_Store
+
+# cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# pytest
+.pytest_cache/
+
+# local stats
+*.stats
+
+# experiment outputs
+experiments/out_trace_demo/
+*.out
+*.log
+*.csv
+
+# generated figures
+fig/*.png

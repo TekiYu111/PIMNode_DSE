@@ -74,14 +74,28 @@ class WorkloadFusionGraphAdapter:
             if src_op is None or dst_op is None:
                 continue
 
+            ten_name = str(tensor)
+            shape, dtype, tensor_type = self._tensor_meta(ten_name)
+            raw_shape = self._get_iter_attr(raw, ("shape",))
+            if raw_shape:
+                shape = tuple(int(x) for x in raw_shape)
+
+            raw_dtype = self._get_attr(raw, ("dtype",), default=None)
+            if raw_dtype is not None:
+                dtype = str(raw_dtype)
+
+            raw_tensor_type = self._get_attr(raw, ("tensor_type",), default=None)
+            if raw_tensor_type is not None:
+                tensor_type = self._enum_or_str(raw_tensor_type)
+
             out.append(
                 FusionDataEdge(
                     src_op=str(src_op),
                     dst_op=str(dst_op),
-                    tensor=str(tensor),
-                    shape=tuple(int(x) for x in self._get_iter_attr(raw, ("shape",))),
-                    dtype=str(self._get_attr(raw, ("dtype",), default="unknown")),
-                    tensor_type=str(self._get_attr(raw, ("tensor_type",), default="unknown")),
+                    tensor=ten_name,
+                    shape=shape,
+                    dtype=dtype,
+                    tensor_type=tensor_type,
                     src_dims=src_dims,
                     dst_dims=dst_dims,
                     #reduction_dims=reduce_dims,
@@ -95,7 +109,57 @@ class WorkloadFusionGraphAdapter:
             return tuple(self._dag.to_op_flow_edges())
         if hasattr(self._dag, "edge_list"):
             return tuple(self._dag.edge_list())
-        raise AttributeError("Workload DAG must provide to_op_flow_edges() or edge_list().")
+        if hasattr(self._dag, "edges"):
+            return tuple(self._dag.edges())
+        raise AttributeError(
+            "Workload DAG must provide to_op_flow_edges(), edge_list(), or edges()."
+        )
+
+    def _tensor_meta(self, tensor: str) -> Tuple[Tuple[int, ...], str, str]:
+        shape: Tuple[int, ...] = ()
+        dtype = "unknown"
+        tensor_type = "unknown"
+
+        if not tensor:
+            return shape, dtype, tensor_type
+
+        ten_obj = None
+        if hasattr(self._dag, "tensor"):
+            try:
+                ten_obj = self._dag.tensor(tensor)
+            except Exception:
+                ten_obj = None
+
+        if ten_obj is None and hasattr(self._dag, "tensors"):
+            try:
+                all_tens = self._dag.tensors()
+                if isinstance(all_tens, dict):
+                    ten_obj = all_tens.get(tensor)
+            except Exception:
+                ten_obj = None
+
+        if ten_obj is None:
+            return shape, dtype, tensor_type
+
+        raw_shape = self._get_iter_attr(ten_obj, ("shape",))
+        if raw_shape:
+            shape = tuple(int(x) for x in raw_shape)
+
+        raw_dtype = self._get_attr(ten_obj, ("dtype",), default=None)
+        if raw_dtype is not None:
+            dtype = str(raw_dtype)
+
+        raw_tensor_type = self._get_attr(ten_obj, ("tensor_type",), default=None)
+        if raw_tensor_type is not None:
+            tensor_type = self._enum_or_str(raw_tensor_type)
+
+        return shape, dtype, tensor_type
+
+    @staticmethod
+    def _enum_or_str(value: Any) -> str:
+        if hasattr(value, "value"):
+            return str(getattr(value, "value"))
+        return str(value)
 
     @staticmethod
     def _get_attr(obj: Any, names: Tuple[str, ...], default: Any = None) -> Any:

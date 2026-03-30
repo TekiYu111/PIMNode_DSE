@@ -1,746 +1,701 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass
+from math import ceil
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from pimnode_dse.workload import WorkloadDAG
-from pimnode_dse.mapping.fusion_gene import FusionGene, FusionStyle, OpFusionGroup, PipelineConstraint
-from pimnode_dse.mapping.mapping_tree import (
-    MappingTree,
-    OpNode,
-    PipelineSpec,
-    ScopeNode,
-    ScopeType,
-    TileNode,
-    LoopNode,
-)
-from pimnode_dse.mapping.tilling_gene import TilingGene
-
-try:
-    from pimnode_dse.placement.templates import build_core_templates
-except Exception:  # pragma: no cover
-    build_core_templates = None
-
-from pimnode_dse.placement.placement_ir import (
-    DEFAULT_MEMORY_LEVELS,
-    BoundaryAction,
-    PlacementScope,
-    PlacementTemplatePlan,
-    PlacementTemplateScope,
-    ResidentSet,
-    instantiate_template_scope,
-    normalize_scope,
-)
-from pimnode_dse.placement.rules import apply_hard_rules
+from pimnode_dse.mapping.fusion.fusion_gene import FusionGene, FusionGroup
+from pimnode_dse.mapping.placement.dataflow import FlowBucket, FlowContract
+from pimnode_dse.mapping.placement.node import GroupDP, PlacementPlan, StoreNode
+from pimnode_dse.mapping.tilling.tilling_gene import GroupTilingSpec
+from pimnode_dse.mapping.tree.mapping_tree import MappingTree, Move, OpNode, ScopeNode, TileNode
 
 
-@dataclass
-class BuildConfig:
-    program_scope_type: ScopeType = ScopeType.Sequential
-    outer_mem_level: str = "DRAM"
-    inner_mem_level: str = "SRAM"
-    default_template_name: Optional[str] = None
-    allow_template_fallback: bool = False
-    include_storage_nodes: bool = True
-    include_load_for_resident: bool = False
-    apply_hard_rules_before_attach: bool = True
-    normalize_memories: Sequence[str] = field(default_factory=lambda: tuple(DEFAULT_MEMORY_LEVELS))
+@dataclass(frozen=True)
+class GroupChoice:
+    group_id: str
+    place: GroupDP
+    tiling: GroupTilingSpec
+    contract: Optional[FlowContract] = None
+    bucket: Optional[FlowBucket] = None
 
 
-@dataclass
-class BuildReport:
-    gene_id: str
-    group_topo: List[str] = field(default_factory=list)
-    op_to_group: Dict[str, str] = field(default_factory=dict)
-    pipeline_constraints: Dict[str, PipelineConstraint] = field(default_factory=dict)
-    placement_selection: Dict[str, str] = field(default_factory=dict)
-    role_bindings: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
+def build_mapping_tree(
+    fusion_gene: FusionGene,
+    placement_plan: Union[PlacementPlan, Mapping[str, GroupDP]],
+    tilings: Mapping[str, Union[GroupTilingSpec, Sequence[GroupTilingSpec]]],
+    *,
+    flow_contracts: Optional[Mapping[str, Sequence[FlowContract]]] = None,
+    flow_buckets: Optional[Mapping[str, Sequence[FlowBucket]]] = None,
+    workload: Optional[Any] = None,
+    group_bind_map: Optional[Mapping[str, str]] = None,
+) -> MappingTree:
+    root = ScopeNode(
+        id="root",
+        bind="seq",
+        mem="dram",
+        stage_kind="root",
+        repeat_hint=1,
+        overlap_policy="none",
+        resource_domain="dram",
+        attrs={"level": "dram"},
+    )
+
+    place_map = _placement_map(placement_plan)
+    bind_map = {str(k): str(v).strip().lower() for k, v in dict(group_bind_map or {}).items()}
+    contract_map = {str(k): tuple(v) for k, v in dict(flow_contracts or {}).items()}
+    bucket_map = {str(k): tuple(v) for k, v in dict(flow_buckets or {}).items()}
+
+    for group in fusion_gene.groups:
+        gid = group.group_id
+        place = place_map.get(gid)
+        if place is None:
+            continue
+
+        tiling = _pick_tiling(tilings.get(gid), gid)
+        if tiling is None:
+            continue
+
+        contract = _pick_contract(contract_map.get(gid, ()))
+        bucket = _pick_bucket(bucket_map.get(gid, ()))
+        bind = bind_map.get(gid, "seq")
+
+        group_scope = _build_group_scope(
+            group=group,
+            place=place,
+            tiling=tiling,
+            bind=bind,
+            contract=contract,
+            bucket=bucket,
+            workload=workload,
+        )
+        root.add_kid(group_scope)
+
+    tree = MappingTree(root=root)
+    tree.validate()
+    return tree
 
 
-@dataclass
-class BuildResult:
-    tree: MappingTree
-    group_scopes: Dict[str, ScopeNode]
-    report: BuildReport
+# --------------------------------------------------
+# Group scope
+# --------------------------------------------------
+
+def _build_group_scope(
+    group: FusionGroup,
+    place: GroupDP,
+    tiling: GroupTilingSpec,
+    *,
+    bind: str,
+    contract: Optional[FlowContract],
+    bucket: Optional[FlowBucket],
+    workload: Optional[Any],
+) -> ScopeNode:
+    group_mem = _group_home_mem(place)
+
+    repeat_hint = _group_repeat_hint(contract=contract, tiling=tiling, group=group, workload=workload)
+    overlap_policy = _group_overlap_policy(contract=contract, tiling=tiling)
+    resource_domain = group_mem
+
+    scope = ScopeNode(
+        id=f"group::{group.group_id}",
+        bind=bind,
+        mem=group_mem,
+        stage_kind="group",
+        repeat_hint=repeat_hint,
+        overlap_policy=overlap_policy,
+        resource_domain=resource_domain,
+        attrs={
+            "group_id": group.group_id,
+            "fusion_ops": tuple(group.ops),
+            "placement_levels": tuple(place.levels()),
+            "group_mem": group_mem,
+            "tiling_group_id": getattr(tiling, "group_id", group.group_id),
+        },
+    )
+
+    if contract is not None:
+        _apply_flow_contract(
+            scope=scope,
+            contract=contract,
+            place=place,
+            group_mem=group_mem,
+            repeat_hint=repeat_hint,
+            workload=workload,
+        )
+        tile_chain = _build_tile_chain_from_contract(
+            group=group,
+            tiling=tiling,
+            contract=contract,
+            workload=workload,
+        )
+    else:
+        if bucket is not None:
+            _apply_flow_bucket(
+                scope=scope,
+                bucket=bucket,
+                place=place,
+                group_mem=group_mem,
+                repeat_hint=repeat_hint,
+                workload=workload,
+            )
+        tile_chain = _build_tile_chain_from_tiling(
+            group=group,
+            tiling=tiling,
+            workload=workload,
+        )
+
+    scope.add_kid(tile_chain)
+    return scope
 
 
-class MappingBuilder:
-    """
-    Build MappingTree from WorkloadDAG + FusionGene + TilingGene + placement templates/scopes.
+# --------------------------------------------------
+# Tile chain
+# --------------------------------------------------
 
-    Updated loop semantics:
-      - tile_size   : local tile extent processed per iteration
-      - problem_size: full visible problem size at this level
-      - loop_count  : actual loop count for this level
+def _build_tile_chain_from_contract(
+    group: FusionGroup,
+    tiling: GroupTilingSpec,
+    contract: FlowContract,
+    workload: Optional[Any],
+) -> TileNode:
+    block_map = {blk.level: blk for blk in contract.level_blocks}
+    level_order = ["dram", "sram", "pe"]
 
-    Compatibility:
-      - if tiling spec only provides tile_size / loop_order, builder still works
-      - if problem_size / loop_count exist, builder now lowers them into TileNode / LoopNode
-    """
+    head: Optional[TileNode] = None
+    prev: Optional[TileNode] = None
 
-    def __init__(
-        self,
-        dag: WorkloadDAG,
-        fusion: FusionGene,
-        tiling: TilingGene,
-        placement_plan: Optional[PlacementTemplatePlan] = None,
-        *,
-        selected_placements: Optional[Mapping[str, PlacementScope]] = None,
-        selected_templates: Optional[Mapping[str, str]] = None,
-        config: Optional[BuildConfig] = None,
-    ) -> None:
-        self.dag = dag
-        self.fusion = fusion
-        self.tiling = tiling
-        self.cfg = config or BuildConfig()
+    for level in level_order:
+        if level not in tiling.tier_tiles:
+            continue
 
-        if self.tiling is None:
-            raise ValueError("TilingGene 是必选输入")
+        spec = tiling.tier_tiles[level]
+        blk = block_map.get(level)
 
-        if placement_plan is None:
-            if self.cfg.allow_template_fallback and build_core_templates is not None:
-                placement_plan = build_core_templates()
-            else:
-                raise ValueError(
-                    "placement_plan 是必选输入。请在 placement 阶段先完成模板生成/筛选，"
-                    "再把 PlacementTemplatePlan 传给 MappingBuilder。"
-                )
+        loops = list(blk.loops) if blk is not None else list(spec.loop_order)
+        size = dict(blk.tile_size) if blk is not None else dict(spec.tile_size)
+        temporal = tuple(blk.temporal_loops) if blk is not None else _default_temporal_loops(level, loops)
+        spatial = tuple(blk.spatial_loops) if blk is not None else _default_spatial_loops(level, loops)
+        repeat_hint = int(blk.repeat_hint) if blk is not None else _repeat_hint_from_tiling(level, spec, group, workload)
+        replication_hint = int(blk.replication_hint) if blk is not None else _replication_hint_from_tiling(level, spec)
+        overlap_hint = bool(blk.overlap_hint) if blk is not None else bool(getattr(spec, "rw_overlap", False))
 
-        self.placement_plan = placement_plan
-        self.selected_placements: Dict[str, PlacementScope] = dict(selected_placements or {})
-        self.selected_templates: Dict[str, str] = dict(selected_templates or {})
-        self.tree_root: Optional[ScopeNode] = None
+        mode = "spat" if spatial else ("spat" if level == "pe" else "temp")
 
-        self._validate_placement_inputs()
-
-    def build(self, phase: str = "prefill") -> BuildResult:
-        if phase not in {"prefill", "decode"}:
-            raise ValueError(f"Unsupported phase: {phase!r}")
-
-        self.dag.validate()
-        self.fusion.validate_topology(self.dag)
-        self.fusion.build_coarse_dag(self.dag)
-
-        op_to_group = self.fusion.get_op_to_group_mapping()
-        group_topo = self._topo_groups()
-        placement_selection, role_binding_report = self._resolve_all_group_placements(phase)
-
-        report = BuildReport(
-            gene_id=self.fusion.gene_id,
-            group_topo=group_topo,
-            op_to_group=dict(op_to_group),
-            pipeline_constraints={
-                g.group_id: g.pipeline_constraint
-                for g in self.fusion.groups
-                if getattr(g.pipeline_constraint, "has_constraints", False)
+        tile = TileNode(
+            id=f"tile::{group.group_id}::{level}",
+            mode=mode,
+            loops=loops,
+            size=size,
+            order=loops,
+            attrs={
+                "level": level,
+                "temporal_loops": temporal,
+                "spatial_loops": spatial,
+                "buf_mode": getattr(spec, "buf_mode", "single"),
+                "rw_overlap": overlap_hint,
+                "repeat_hint": repeat_hint,
+                "replication_hint": replication_hint,
+                "acc_scope": getattr(tiling, "acc_scope", "sram"),
+                "split_red": tuple(getattr(tiling, "split_red", ())),
             },
-            placement_selection={gid: scope.scope_name for gid, scope in placement_selection.items()},
-            role_bindings=role_binding_report,
         )
 
-        self.tree_root = ScopeNode(
-            scope_type=self.cfg.program_scope_type,
-            name=f"Program({self.dag.name})",
-            phase=phase,
+        if head is None:
+            head = tile
+        if prev is not None:
+            prev.set_kid(tile)
+        prev = tile
+
+    op_scope = _build_op_scope(group, workload)
+    assert prev is not None
+    prev.set_kid(op_scope)
+    assert head is not None
+    return head
+
+
+def _build_tile_chain_from_tiling(
+    group: FusionGroup,
+    tiling: GroupTilingSpec,
+    workload: Optional[Any],
+) -> TileNode:
+    level_order = ["dram", "sram", "pe"]
+
+    head: Optional[TileNode] = None
+    prev: Optional[TileNode] = None
+
+    for level in level_order:
+        if level not in tiling.tier_tiles:
+            continue
+
+        spec = tiling.tier_tiles[level]
+        loops = list(spec.loop_order)
+        temporal = _default_temporal_loops(level, loops)
+        spatial = _default_spatial_loops(level, loops)
+        repeat_hint = _repeat_hint_from_tiling(level, spec, group, workload)
+        replication_hint = _replication_hint_from_tiling(level, spec)
+        overlap_hint = bool(getattr(spec, "rw_overlap", False))
+
+        mode = "spat" if spatial else ("spat" if level == "pe" else "temp")
+
+        tile = TileNode(
+            id=f"tile::{group.group_id}::{level}",
+            mode=mode,
+            loops=loops,
+            size=dict(spec.tile_size),
+            order=list(spec.loop_order),
+            attrs={
+                "level": level,
+                "temporal_loops": temporal,
+                "spatial_loops": spatial,
+                "buf_mode": getattr(spec, "buf_mode", "single"),
+                "rw_overlap": overlap_hint,
+                "repeat_hint": repeat_hint,
+                "replication_hint": replication_hint,
+                "acc_scope": getattr(tiling, "acc_scope", "sram"),
+                "split_red": tuple(getattr(tiling, "split_red", ())),
+            },
         )
 
-        group_scopes: Dict[str, ScopeNode] = {}
-        for group in self.fusion.groups:
-            group_scopes[group.group_id] = self._make_group_scope(group, placement_selection[group.group_id])
+        if head is None:
+            head = tile
+        if prev is not None:
+            prev.set_kid(tile)
+        prev = tile
 
-        for gid in group_topo:
-            self.tree_root.add_child(group_scopes[gid])
+    op_scope = _build_op_scope(group, workload)
+    assert prev is not None
+    prev.set_kid(op_scope)
+    assert head is not None
+    return head
 
-        op_index: Dict[str, OpNode] = {}
-        topo_ops = self.dag.topo_order()
 
-        for group in self.fusion.groups:
-            group_scope = group_scopes[group.group_id]
-            placement_scope = placement_selection[group.group_id]
-            _, inner_tile, op_attach_point = self._attach_tiles_from_tiling(
-                group=group,
-                group_scope=group_scope,
-                group_id=group.group_id,
-                placement_scope=placement_scope,
-            )
-            self._attach_ops_in_group(
-                op_parent=op_attach_point,
-                group=group,
-                topo_ops=topo_ops,
-                op_to_group=op_to_group,
-                op_index_out=op_index,
-            )
+def _build_op_scope(group: FusionGroup, workload: Optional[Any]) -> ScopeNode:
+    scope = ScopeNode(
+        id=f"ops::{group.group_id}",
+        bind="seq",
+        mem="pe",
+        stage_kind="ops",
+        repeat_hint=1,
+        overlap_policy="none",
+        resource_domain="pe",
+        attrs={"group_id": group.group_id, "ops": tuple(group.ops)},
+    )
 
-        tree = MappingTree(root=self.tree_root, op_index=op_index)
-        return BuildResult(tree=tree, group_scopes=group_scopes, report=report)
+    # 用 op 的 I/O 粗略填充 active tensor class
+    read_tensors = set()
+    update_tensors = set()
+    for op_id in group.ops:
+        op_node = _build_op_node(op_id, workload)
+        scope.add_kid(op_node)
+        read_tensors.update(op_node.ins)
+        update_tensors.update(op_node.outs)
 
-    def _validate_placement_inputs(self) -> None:
-        if self.placement_plan is None:
-            raise ValueError("placement_plan 不能为空")
+    scope.read_tensors = read_tensors
+    scope.update_tensors = update_tensors
+    scope.live_in = set(read_tensors)
+    scope.live_out = set(update_tensors)
+    return scope
 
-        missing_from_plan = [
-            name for name in self.selected_templates.values()
-            if name not in self.placement_plan.scopes
-        ]
-        if missing_from_plan:
-            raise KeyError(f"selected_templates 引用了未定义模板: {sorted(set(missing_from_plan))}")
 
-        if self.cfg.default_template_name is not None:
-            if self.cfg.default_template_name not in self.placement_plan.scopes:
-                raise KeyError(
-                    f"default_template_name={self.cfg.default_template_name!r} 不在 placement_plan 中"
+# --------------------------------------------------
+# Op nodes
+# --------------------------------------------------
+
+def _build_op_node(op_id: str, workload: Optional[Any]) -> OpNode:
+    if workload is None:
+        return OpNode(
+            id=op_id,
+            kind="unknown",
+            ins=(),
+            outs=(),
+            attrs={},
+        )
+
+    op = workload.op(op_id) if hasattr(workload, "op") else None
+    if op is None:
+        return OpNode(
+            id=op_id,
+            kind="unknown",
+            ins=(),
+            outs=(),
+            attrs={},
+        )
+
+    kind = str(getattr(op, "op_type", "unknown"))
+    ins = tuple(str(x) for x in getattr(op, "inputs", ()))
+    outs = tuple(str(x) for x in getattr(op, "outputs", ()))
+
+    return OpNode(
+        id=op_id,
+        kind=kind,
+        ins=ins,
+        outs=outs,
+        attrs={
+            "op_type": kind,
+            "iter_dims": tuple(str(x).strip().lower() for x in getattr(op, "iter_dims", ())),
+            "reduce_dims": tuple(str(x).strip().lower() for x in getattr(op, "reduce_dims", ())),
+            "tensor_dims": {
+                str(k): tuple(str(x).strip().lower() for x in v)
+                for k, v in getattr(op, "tensor_dims", {}).items()
+            },
+        },
+    )
+
+
+# --------------------------------------------------
+# Flow semantic injection
+# --------------------------------------------------
+
+def _apply_flow_contract(
+    scope: ScopeNode,
+    contract: FlowContract,
+    *,
+    place: GroupDP,
+    group_mem: str,
+    repeat_hint: int,
+    workload: Optional[Any],
+) -> None:
+    scope.need = set(contract.group_get)
+    scope.keep = set(contract.reuse_out)
+    scope.live_in = set(contract.group_get)
+    scope.live_out = set(contract.reuse_out)
+
+    scope.fill_tensors = set(contract.group_get)
+    scope.read_tensors = set(contract.group_get) | set(contract.reuse_out) | set(contract.edge_tensors)
+    scope.update_tensors = set(contract.reuse_out) | set(contract.hold_tensors)
+    scope.wb_tensors = set(contract.group_out)
+
+    # pinned/evict semantics (group-scope only):
+    # - pinned: keep it alive in this scope, but DO NOT skip boundary load/store; we stay conservative.
+    # - evict: ensure a store if written and not already emitted.
+    pinned = _tensors_with_residence(place, group_mem, "pinned")
+    evict = _tensors_with_residence(place, group_mem, "evict")
+
+    scope.keep |= pinned
+
+    scope.entry = [
+        Move(
+            act="load",
+            tens=str(ten),
+            src="dram",
+            dst=group_mem,
+            bytes=_tensor_size_bytes(workload, ten),
+            role=_tensor_role(workload, ten),
+            repeat_hint=repeat_hint,
+            scope_id=scope.id,
+        )
+        for ten in contract.group_get
+    ]
+
+    scope.exit = [
+        Move(
+            act="writeback" if ten in set(contract.reuse_out) else "store",
+            tens=str(ten),
+            src=group_mem,
+            dst="dram",
+            bytes=_tensor_size_bytes(workload, ten),
+            role=_tensor_role(workload, ten),
+            repeat_hint=repeat_hint,
+            scope_id=scope.id,
+        )
+        for ten in contract.group_out
+    ]
+
+    have_exit = {mv.tens for mv in scope.exit}
+    for ten in sorted(evict):
+        if ten in set(contract.group_out) and ten not in have_exit:
+            scope.exit.append(
+                Move(
+                    act="store",
+                    tens=str(ten),
+                    src=group_mem,
+                    dst="dram",
+                    bytes=_tensor_size_bytes(workload, ten),
+                    role=_tensor_role(workload, ten),
+                    repeat_hint=repeat_hint,
+                    scope_id=scope.id,
                 )
-
-    def _resolve_all_group_placements(
-        self,
-        phase: str,
-    ) -> Tuple[Dict[str, PlacementScope], Dict[str, Dict[str, List[str]]]]:
-        placements: Dict[str, PlacementScope] = {}
-        role_report: Dict[str, Dict[str, List[str]]] = {}
-        for group in self.fusion.groups:
-            scope, bindings = self._resolve_group_placement(group, phase)
-            placements[group.group_id] = scope
-            role_report[group.group_id] = {
-                role: sorted(tensors) for role, tensors in bindings.items() if tensors
-            }
-        return placements, role_report
-
-    def _validate_template_compatibility(
-        self,
-        group: OpFusionGroup,
-        template_scope: PlacementTemplateScope,
-        *,
-        resolved_phase: Optional[str],
-        resolved_special_role: Optional[str],
-    ) -> None:
-        if template_scope.supported_phases:
-            if resolved_phase and resolved_phase not in template_scope.supported_phases:
-                raise ValueError(
-                    f"group {group.group_id} phase={resolved_phase!r} "
-                    f"is not supported by template {template_scope.scope_name!r}. "
-                    f"supported_phases={sorted(template_scope.supported_phases)}"
-                )
-
-        if template_scope.supported_roles:
-            if resolved_special_role and resolved_special_role not in template_scope.supported_roles:
-                raise ValueError(
-                    f"group {group.group_id} special_role={resolved_special_role!r} "
-                    f"is not supported by template {template_scope.scope_name!r}. "
-                    f"supported_roles={sorted(template_scope.supported_roles)}"
-                )
-
-    def _resolve_group_placement(
-        self,
-        group: OpFusionGroup,
-        phase: str,
-    ) -> Tuple[PlacementScope, Dict[str, Set[str]]]:
-        resolved_phase = getattr(group, "phase", None) or phase
-        resolved_special_role = getattr(group, "special_role", None)
-
-        role_to_tensors = self._build_role_to_tensors(group)
-        tensor_to_role = self._invert_role_bindings(role_to_tensors)
-        tensor_meta = self._build_tensor_meta_for_group(group)
-
-        if group.group_id in self.selected_placements:
-            concrete = self._clone_scope(
-                self.selected_placements[group.group_id],
-                phase=resolved_phase,
-            )
-            concrete = normalize_scope(
-                concrete,
-                memory_levels=self.cfg.normalize_memories,
-            )
-            if self.cfg.apply_hard_rules_before_attach:
-                concrete = apply_hard_rules(
-                    concrete,
-                    phase=resolved_phase,
-                    tensor_to_role=tensor_to_role,
-                    tensor_meta=tensor_meta,
-                    memories=self.cfg.normalize_memories,
-                )
-            return concrete, role_to_tensors
-
-        scope_name = self._select_template_name_for_group(group)
-        template_scope = self.placement_plan.scopes[scope_name]
-
-        self._validate_template_compatibility(
-            group,
-            template_scope,
-            resolved_phase=resolved_phase,
-            resolved_special_role=resolved_special_role,
-        )
-
-        concrete = instantiate_template_scope(
-            template_scope,
-            role_bindings=role_to_tensors,
-            phase=resolved_phase,
-            special_role=resolved_special_role,
-        )
-        concrete = normalize_scope(
-            concrete,
-            memory_levels=self.cfg.normalize_memories,
-        )
-
-        if self.cfg.apply_hard_rules_before_attach:
-            concrete = apply_hard_rules(
-                concrete,
-                phase=resolved_phase,
-                tensor_to_role=tensor_to_role,
-                tensor_meta=tensor_meta,
-                memories=self.cfg.normalize_memories,
             )
 
-        return concrete, role_to_tensors
-
-    def _select_template_name_for_group(self, group: OpFusionGroup) -> str:
-        if group.group_id in self.selected_templates:
-            return self.selected_templates[group.group_id]
-
-        if self.cfg.default_template_name is not None:
-            return self.cfg.default_template_name
-
-        if len(self.placement_plan.scopes) == 1:
-            return next(iter(self.placement_plan.scopes.keys()))
-
-        available = sorted(self.placement_plan.scopes.keys())
-        raise ValueError(
-            f"group {group.group_id} 缺少显式 placement 选择。可用模板: {available}. "
-            "请通过 selected_templates / selected_placements 传入每个 group 的模板，"
-            "或在 BuildConfig.default_template_name 中指定默认模板。"
-        )
-
-    def _clone_scope(self, scope: PlacementScope, phase: Optional[str] = None) -> PlacementScope:
-        resident_sets = [ResidentSet(mem=rs.mem, tensors=set(rs.tensors)) for rs in scope.resident_sets]
-        boundary_actions = [
-            BoundaryAction(
-                mem=ba.mem,
-                prefetch=set(ba.prefetch),
-                writeback=set(ba.writeback),
-                evict=set(ba.evict),
-            )
-            for ba in scope.boundary_actions
-        ]
-        cloned = PlacementScope(
-            scope_name=scope.scope_name,
-            resident_sets=resident_sets,
-            boundary_actions=boundary_actions,
-            phase=phase if phase is not None else getattr(scope, "phase", None),
-            special_role=getattr(scope, "special_role", None),
-            metadata=dict(getattr(scope, "metadata", {}) or {}),
-        )
-        return cloned
-
-    def _build_role_to_tensors(self, group: OpFusionGroup) -> Dict[str, Set[str]]:
-        group_tensor_names = self._collect_group_tensor_names(group)
-
-        role_to_tensors: Dict[str, Set[str]] = {
-            "Q": set(),
-            "K": set(),
-            "V": set(),
-            "SCORES": set(),
-            "STATS": set(),
-            "PROBS": set(),
-            "PARTIAL_O": set(),
-            "O": set(),
-            "KV_CACHE": set(),
+    scope.attrs["contract_edge_tensors"] = tuple(contract.edge_tensors)
+    scope.attrs["contract_hold_tensors"] = tuple(contract.hold_tensors)
+    scope.attrs["level_blocks"] = tuple(
+        {
+            "level": blk.level,
+            "loops": tuple(blk.loops),
+            "tile_size": dict(blk.tile_size),
+            "temporal_loops": tuple(blk.temporal_loops),
+            "spatial_loops": tuple(blk.spatial_loops),
+            "repeat_hint": blk.repeat_hint,
+            "replication_hint": blk.replication_hint,
+            "overlap_hint": blk.overlap_hint,
         }
+        for blk in contract.level_blocks
+    )
 
-        for tensor_name in group_tensor_names:
-            role = self._infer_tensor_role(tensor_name)
-            if role is None:
-                continue
-            role_to_tensors.setdefault(role, set()).add(tensor_name)
 
-            meta = self._lookup_tensor_spec(tensor_name)
-            special_role = self._get_attr(meta, "special_role")
-            if special_role == "KV_CACHE":
-                role_to_tensors.setdefault("KV_CACHE", set()).add(tensor_name)
+def _apply_flow_bucket(
+    scope: ScopeNode,
+    bucket: FlowBucket,
+    *,
+    place: GroupDP,
+    group_mem: str,
+    repeat_hint: int,
+    workload: Optional[Any],
+) -> None:
+    out = bucket.out
 
-        return role_to_tensors
+    scope.need = set(out.group_get)
+    scope.keep = set(out.reuse_out)
+    scope.live_in = set(out.group_get)
+    scope.live_out = set(out.reuse_out)
 
-    def _invert_role_bindings(self, role_to_tensors: Mapping[str, Iterable[str]]) -> Dict[str, str]:
-        tensor_to_role: Dict[str, str] = {}
-        for role, tensors in role_to_tensors.items():
-            for tensor in tensors:
-                if tensor in tensor_to_role and tensor_to_role[tensor] != "KV_CACHE":
-                    continue
-                tensor_to_role[tensor] = role
-        return tensor_to_role
+    scope.fill_tensors = set(out.group_get)
+    scope.read_tensors = set(out.group_get) | set(out.reuse_out)
+    scope.update_tensors = set(out.reuse_out)
+    scope.wb_tensors = set(out.group_out)
 
-    def _build_tensor_meta_for_group(self, group: OpFusionGroup) -> Dict[str, Dict[str, object]]:
-        out: Dict[str, Dict[str, object]] = {}
-        for tensor_name in self._collect_group_tensor_names(group):
-            spec = self._lookup_tensor_spec(tensor_name)
-            if spec is None:
-                out[tensor_name] = {}
-                continue
-            meta = {
-                "role": self._get_attr(spec, "role"),
-                "special_role": self._get_attr(spec, "special_role"),
-                "name": self._get_attr(spec, "name") or tensor_name,
-            }
-            out[tensor_name] = {k: v for k, v in meta.items() if v is not None}
+    # pinned/evict semantics (group-scope only)
+    pinned = _tensors_with_residence(place, group_mem, "pinned")
+    evict = _tensors_with_residence(place, group_mem, "evict")
+
+    scope.keep |= pinned
+
+    scope.entry = [
+        Move(
+            act="load",
+            tens=str(ten),
+            src="dram",
+            dst=group_mem,
+            bytes=_tensor_size_bytes(workload, ten),
+            role=_tensor_role(workload, ten),
+            repeat_hint=repeat_hint,
+            scope_id=scope.id,
+        )
+        for ten in out.group_get
+        if ten not in pinned
+    ]
+
+    scope.exit = [
+        Move(
+            act="writeback" if ten in set(out.reuse_out) else "store",
+            tens=str(ten),
+            src=group_mem,
+            dst="dram",
+            bytes=_tensor_size_bytes(workload, ten),
+            role=_tensor_role(workload, ten),
+            repeat_hint=repeat_hint,
+            scope_id=scope.id,
+        )
+        for ten in out.group_out
+        if ten not in pinned
+    ]
+
+    have_exit = {mv.tens for mv in scope.exit}
+    for ten in sorted(evict):
+        if ten in set(out.group_out) and ten not in have_exit and ten not in pinned:
+            scope.exit.append(
+                Move(
+                    act="store",
+                    tens=str(ten),
+                    src=group_mem,
+                    dst="dram",
+                    bytes=_tensor_size_bytes(workload, ten),
+                    role=_tensor_role(workload, ten),
+                    repeat_hint=repeat_hint,
+                    scope_id=scope.id,
+                )
+            )
+
+
+def _tensors_with_residence(place: GroupDP, group_mem: str, want: str) -> set[str]:
+    lv = str(group_mem).strip().lower()
+    mode = str(want).strip().lower()
+    out: set[str] = set()
+    for node in place.nodes_at(lv):
+        if str(getattr(node, "residence", "single")).strip().lower() != mode:
+            continue
+        for ten in node.tens:
+            name = str(ten).strip()
+            if name:
+                out.add(name)
+    return out
+
+
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
+
+def _group_home_mem(place: GroupDP) -> str:
+    levels = place.levels()
+    return levels[-1] if levels else "dram"
+
+
+def _pick_tiling(
+    raw: Optional[Union[GroupTilingSpec, Sequence[GroupTilingSpec]]],
+    gid: str,
+) -> Optional[GroupTilingSpec]:
+    del gid
+    if raw is None:
+        return None
+    if isinstance(raw, GroupTilingSpec):
+        return raw
+
+    rows = tuple(raw)
+    if not rows:
+        return None
+
+    rows = sorted(
+        rows,
+        key=lambda x: (
+            len(getattr(x, "split_red", ())),
+            getattr(x, "acc_scope", "sram") != "local",
+            str(getattr(x, "tier_tiles", {})),
+        ),
+    )
+    return rows[0]
+
+
+def _pick_contract(rows: Sequence[FlowContract]) -> Optional[FlowContract]:
+    if not rows:
+        return None
+    return rows[0]
+
+
+def _pick_bucket(rows: Sequence[FlowBucket]) -> Optional[FlowBucket]:
+    if not rows:
+        return None
+    return rows[0]
+
+
+def _placement_map(src: Union[PlacementPlan, Mapping[str, GroupDP]]) -> Dict[str, GroupDP]:
+    if isinstance(src, PlacementPlan):
+        return src.group_map()
+    return {str(k): v for k, v in dict(src).items()}
+
+
+def _group_loop_extents(group: FusionGroup, workload: Optional[Any]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if workload is None:
         return out
 
-    def _collect_group_tensor_names(self, group: OpFusionGroup) -> Set[str]:
-        tensors: Set[str] = set()
-        for op_id in group.op_names:
-            op = self.dag.get_op(op_id)
-            for name in self._iter_op_tensors(op, "inputs"):
-                tensors.add(name)
-            for name in self._iter_op_tensors(op, "outputs"):
-                tensors.add(name)
-        return tensors
+    for op_id in group.ops:
+        op = workload.op(op_id) if hasattr(workload, "op") else None
+        if op is None:
+            continue
 
-    def _iter_op_tensors(self, op: Any, field_name: str) -> Iterable[str]:
-        vals = getattr(op, field_name, None)
-        if vals is None and isinstance(op, Mapping):
-            vals = op.get(field_name)
+        for dim, val in getattr(op, "dim_constraints", {}).items():
+            key = str(dim).strip().lower()
+            out[key] = max(out.get(key, 1), int(val))
 
-        if vals is None:
-            return []
+        for dim in getattr(op, "iter_dims", ()):
+            key = str(dim).strip().lower()
+            out.setdefault(key, 1)
 
-        if isinstance(vals, Mapping):
-            out: List[str] = []
-            for v in vals.values():
-                if isinstance(v, (list, tuple, set)):
-                    out.extend(str(x) for x in v)
-                else:
-                    out.append(str(v))
-            return out
+    return out
 
-        if isinstance(vals, (list, tuple, set)):
-            return [str(x) for x in vals]
 
-        return [str(vals)]
+def _default_temporal_loops(level: str, loops: Sequence[str]) -> Tuple[str, ...]:
+    if str(level).strip().lower() == "pe":
+        return ()
+    return tuple(str(x).strip().lower() for x in loops if str(x).strip())
 
-    def _lookup_tensor_spec(self, tensor_name: str) -> Any:
-        tensor_table = getattr(self.dag, "tensors", None)
-        if isinstance(tensor_table, Mapping):
-            return tensor_table.get(tensor_name)
 
-        if hasattr(self.dag, "get_tensor"):
-            try:
-                return self.dag.get_tensor(tensor_name)
-            except Exception:
-                return None
-        return None
+def _default_spatial_loops(level: str, loops: Sequence[str]) -> Tuple[str, ...]:
+    if str(level).strip().lower() == "pe":
+        return tuple(str(x).strip().lower() for x in loops if str(x).strip())
+    return ()
 
-    def _infer_tensor_role(self, tensor_name: str) -> Optional[str]:
-        spec = self._lookup_tensor_spec(tensor_name)
-        if spec is not None:
-            special_role = self._get_attr(spec, "special_role")
-            role = self._get_attr(spec, "role")
-            name = str(self._get_attr(spec, "name") or tensor_name)
 
-            if special_role in {
-                "KV_CACHE",
-                "PARTIAL_O",
-                "STATS",
-                "SCORES",
-                "PROBS",
-            }:
-                return str(special_role)
-            if role in {
-                "Q",
-                "K",
-                "V",
-                "O",
-                "SCORES",
-                "STATS",
-                "PROBS",
-                "PARTIAL_O",
-                "KV_CACHE",
-            }:
-                return str(role)
+def _repeat_hint_from_tiling(level: str, spec: Any, group: FusionGroup, workload: Optional[Any]) -> int:
+    temporal_loops = _default_temporal_loops(level, spec.loop_order)
+    loop_extents = _group_loop_extents(group, workload)
+    repeat = 1
+    for loop in temporal_loops:
+        full = max(1, int(loop_extents.get(loop, 1)))
+        part = max(1, int(spec.tile_size.get(loop, full)))
+        repeat *= int(ceil(float(full) / float(part)))
+    return max(1, repeat)
 
-            guessed = self._infer_role_from_name(name)
-            if guessed is not None:
-                return guessed
 
-        return self._infer_role_from_name(tensor_name)
+def _replication_hint_from_tiling(level: str, spec: Any) -> int:
+    spatial_loops = _default_spatial_loops(level, spec.loop_order)
+    repl = 1
+    for loop in spatial_loops:
+        repl *= max(1, int(spec.tile_size.get(loop, 1)))
+    return max(1, repl)
 
-    def _infer_role_from_name(self, name: str) -> Optional[str]:
-        u = str(name).upper()
-        if "KV_CACHE" in u:
-            return "KV_CACHE"
-        if "PARTIAL" in u and "O" in u:
-            return "PARTIAL_O"
-        if "STAT" in u:
-            return "STATS"
-        if "SCORE" in u:
-            return "SCORES"
-        if "PROB" in u:
-            return "PROBS"
-        if u == "Q" or u.startswith("Q_"):
-            return "Q"
-        if u == "K" or u.startswith("K_"):
-            return "K"
-        if u == "V" or u.startswith("V_"):
-            return "V"
-        if u == "O" or u.startswith("O_") or u.endswith("_O"):
-            return "O"
-        return None
 
-    def _get_attr(self, obj: Any, attr: str) -> Any:
-        if obj is None:
-            return None
-        if isinstance(obj, Mapping):
-            return obj.get(attr)
-        return getattr(obj, attr, None)
+def _group_repeat_hint(
+    *,
+    contract: Optional[FlowContract],
+    tiling: GroupTilingSpec,
+    group: FusionGroup,
+    workload: Optional[Any],
+) -> int:
+    if contract is not None and contract.level_blocks:
+        val = 1
+        for blk in contract.level_blocks:
+            val = max(val, int(blk.repeat_hint))
+        return max(1, val)
 
-    def _topo_groups(self) -> List[str]:
-        if hasattr(self.fusion, "coarse_topo_order"):
-            try:
-                order = list(self.fusion.coarse_topo_order())
-                if order:
-                    return order
-            except Exception:
-                pass
-        return [g.group_id for g in self.fusion.groups]
+    total = 1
+    for level, spec in tiling.tier_tiles.items():
+        total = max(total, _repeat_hint_from_tiling(str(level), spec, group, workload))
+    return max(1, total)
 
-    def _make_group_scope(self, group: OpFusionGroup, placement_scope: PlacementScope) -> ScopeNode:
-        scope_type = ScopeType.Group
-        pipeline_spec: Optional[PipelineSpec] = None
-        if group.fusion_style == FusionStyle.PIPELINE:
-            scope_type = ScopeType.Pipeline
-            pc = group.pipeline_constraint
-            pipeline_spec = PipelineSpec(
-                pipeline_dim=getattr(group, "pipeline_dim", None),
-                num_stages=max(2, int(getattr(pc, "num_stages", 2))),
-                buffering=getattr(pc, "buffering", "pingpong"),
-                allow_interleave=bool(getattr(pc, "allow_interleave", True)),
-                constraint=pc,
-            )
 
-        return ScopeNode(
-            scope_type=scope_type,
-            name=f"Group({group.group_id})",
-            pipeline_spec=pipeline_spec,
-            phase=group.phase,
-            special_role=group.special_role,
-            placement_state=placement_scope,
-        )
+def _group_overlap_policy(
+    *,
+    contract: Optional[FlowContract],
+    tiling: GroupTilingSpec,
+) -> str:
+    if contract is not None:
+        for blk in contract.level_blocks:
+            if blk.overlap_hint:
+                return "rw"
 
-    def _get_group_tiling_spec(self, group: OpFusionGroup) -> Any:
-        group_id = group.group_id
-        spec = self.tiling.get_group_spec(group_id, phase=group.phase, role=group.special_role)
-        if spec is not None:
-            return spec
+    for _, spec in tiling.tier_tiles.items():
+        if bool(getattr(spec, "rw_overlap", False)):
+            return "rw"
+    return "none"
 
-        for attr in ("group_tiles", "group_specs"):
-            table = getattr(self.tiling, attr, None)
-            if isinstance(table, Mapping) and group_id in table:
-                return table[group_id]
 
-        raise KeyError(f"TilingGene 中找不到 group {group_id!r} 的 tiling spec")
+def _tensor_size_bytes(workload: Optional[Any], tensor_name: str) -> int:
+    if workload is None:
+        return 0
+    try:
+        return int(workload.tensor(tensor_name).size_bytes())
+    except Exception:
+        return 0
 
-    def _lookup_tile_spec(self, gspec: Any, mem_level: str) -> Any:
-        tiles = getattr(gspec, "tiles", None)
-        if tiles is None and isinstance(gspec, Mapping):
-            tiles = gspec.get("tiles")
-        if tiles is None:
-            return None
-        if isinstance(tiles, Mapping):
-            return tiles.get(mem_level)
+
+def _tensor_role(workload: Optional[Any], tensor_name: str) -> str:
+    if workload is not None:
         try:
-            return getattr(tiles, mem_level)
+            tensor = workload.tensor(tensor_name)
+            role = getattr(tensor, "role", None)
+            if role is not None:
+                value = getattr(role, "value", role)
+                text = str(value).strip().upper()
+                if text == "O":
+                    return "output"
+                if text in {"Q", "K", "V"}:
+                    return "input"
         except Exception:
-            return None
+            pass
 
-    def _extract_tile_attrs(
-        self,
-        tile_spec: Any,
-    ) -> Tuple[
-        Optional[Dict[str, int]],
-        Optional[List[str]],
-        Optional[Dict[str, int]],
-        Optional[Dict[str, int]],
-        bool,
-    ]:
-        if tile_spec is None:
-            return None, None, None, None, False
+    text = str(tensor_name).strip().upper()
+    if text == "O":
+        return "output"
+    if "CACHE" in text or "CTX" in text:
+        return "state"
+    if text in {"Q", "K", "V", "K_APPEND", "V_APPEND"}:
+        return "input"
+    return "temp"
 
-        if hasattr(tile_spec, "get_tile_desc"):
-            desc = tile_spec.get_tile_desc()
-            tile_size = desc.get("tile_size")
-            loop_order = desc.get("loop_order")
-            problem_size = desc.get("problem_size")
-            loop_count = desc.get("loop_count")
-            is_spatial = bool(getattr(tile_spec, "is_spatial", False))
-            return tile_size, loop_order, problem_size, loop_count, is_spatial
 
-        if isinstance(tile_spec, Mapping):
-            tile_size = tile_spec.get("tile_size")
-            loop_order = tile_spec.get("loop_order")
-            problem_size = tile_spec.get("problem_size")
-            loop_count = tile_spec.get("loop_count")
-            is_spatial = bool(tile_spec.get("is_spatial", False))
-            return tile_size, loop_order, problem_size, loop_count, is_spatial
-
-        tile_size = getattr(tile_spec, "tile_size", None)
-        loop_order = getattr(tile_spec, "loop_order", None)
-        problem_size = getattr(tile_spec, "problem_size", None)
-        loop_count = getattr(tile_spec, "loop_count", None)
-        is_spatial = bool(getattr(tile_spec, "is_spatial", False))
-        return tile_size, loop_order, problem_size, loop_count, is_spatial
-
-    def _attach_tiles_from_tiling(
-        self,
-        group: OpFusionGroup,
-        group_scope: ScopeNode,
-        group_id: str,
-        placement_scope: PlacementScope,
-    ) -> Tuple[TileNode, TileNode, Any]:
-        gspec = self._get_group_tiling_spec(group)
-        phase = getattr(gspec, "phase", None) or group.phase
-        special_role = getattr(gspec, "special_role", None) or group.special_role
-
-        role_to_tensors = self._build_role_to_tensors(group)
-        tensor_to_role = self._invert_role_bindings(role_to_tensors)
-        tensor_meta = self._build_tensor_meta_for_group(group)
-
-        outer_tile_spec = self._lookup_tile_spec(gspec, self.cfg.outer_mem_level)
-        (
-            outer_tile_size,
-            outer_loop_order,
-            outer_problem_size,
-            outer_loop_count,
-            outer_is_spatial,
-        ) = self._extract_tile_attrs(outer_tile_spec)
-        outer = TileNode(
-            mem_level=self.cfg.outer_mem_level,
-            tile_size=outer_tile_size,
-            loop_order=outer_loop_order,
-            problem_size=outer_problem_size,
-            loop_count=outer_loop_count,
-            is_spatial=outer_is_spatial,
-            name=f"{group_id}:{self.cfg.outer_mem_level}_TILE",
-            placement_state=placement_scope,
-            phase=phase,
-            special_role=special_role,
-        )
-        group_scope.add_child(outer)
-
-        inner_tile_spec = self._lookup_tile_spec(gspec, self.cfg.inner_mem_level)
-        (
-            inner_tile_size,
-            inner_loop_order,
-            inner_problem_size,
-            inner_loop_count,
-            inner_is_spatial,
-        ) = self._extract_tile_attrs(inner_tile_spec)
-        inner = TileNode(
-            mem_level=self.cfg.inner_mem_level,
-            tile_size=inner_tile_size,
-            loop_order=inner_loop_order,
-            problem_size=inner_problem_size,
-            loop_count=inner_loop_count,
-            is_spatial=inner_is_spatial,
-            name=f"{group_id}:{self.cfg.inner_mem_level}_TILE",
-            placement_state=placement_scope,
-            phase=phase,
-            special_role=special_role,
-        )
-        outer.add_child(inner)
-
-        outer.materialize_placement(
-            default_src=self._default_src_for(self.cfg.outer_mem_level),
-            default_dst=self._default_dst_for(self.cfg.outer_mem_level),
-            include_storage=self.cfg.include_storage_nodes,
-            include_load_for_resident=self.cfg.include_load_for_resident,
-            tensor_to_role=tensor_to_role,
-            tensor_meta=tensor_meta,
-            use_rules=True,
-        )
-        inner.materialize_placement(
-            default_src=self._default_src_for(self.cfg.inner_mem_level),
-            default_dst=self._default_dst_for(self.cfg.inner_mem_level),
-            include_storage=self.cfg.include_storage_nodes,
-            include_load_for_resident=self.cfg.include_load_for_resident,
-            tensor_to_role=tensor_to_role,
-            tensor_meta=tensor_meta,
-            use_rules=True,
-        )
-
-        op_attach_point = self._ensure_loopnest(inner)
-        return outer, inner, op_attach_point
-
-    def _ensure_loopnest(self, tile: TileNode) -> Any:
-        for child in tile.children:
-            if isinstance(child, LoopNode):
-                cur = child
-                while True:
-                    nxt = next((c for c in getattr(cur, "children", []) if isinstance(c, LoopNode)), None)
-                    if nxt is None:
-                        break
-                    cur = nxt
-                return cur
-
-        parent: Any = tile
-        last: Any = tile
-        for dim in tile.loop_order or []:
-            tile_extent = tile.tile_size.get(dim) if tile.tile_size else None
-            problem_size = tile.problem_size.get(dim) if tile.problem_size else None
-            loop_count = tile.loop_count.get(dim) if tile.loop_count else None
-
-            if loop_count is None and problem_size is not None and tile_extent not in (None, 0):
-                try:
-                    loop_count = -(-int(problem_size) // int(tile_extent))
-                except Exception:
-                    loop_count = None
-
-            kind = "spatial" if tile.is_spatial else "temporal"
-
-            loop = LoopNode(
-                iter_dim=dim,
-                tile_extent=tile_extent,
-                problem_size=problem_size,
-                loop_count=loop_count,
-                domain=None,
-                kind=kind,
-                name=f"{tile.name}:loop_{dim}",
-            )
-            parent.add_child(loop)
-            parent = loop
-            last = loop
-        return last
-
-    def _level_order(self) -> List[str]:
-        return ["DRAM", "SRAM", "RF", "PE"]
-
-    def _default_src_for(self, mem_level: str) -> Optional[str]:
-        order = self._level_order()
-        if mem_level not in order:
-            return None
-        idx = order.index(mem_level)
-        return order[idx - 1] if idx > 0 else None
-
-    def _default_dst_for(self, mem_level: str) -> Optional[str]:
-        order = self._level_order()
-        if mem_level not in order:
-            return None
-        idx = order.index(mem_level)
-        return order[idx - 1] if idx > 0 else None
-
-    def _attach_ops_in_group(
-        self,
-        op_parent: Any,
-        group: OpFusionGroup,
-        topo_ops: List[str],
-        op_to_group: Dict[str, str],
-        op_index_out: Dict[str, OpNode],
-    ) -> None:
-        for op_id in topo_ops:
-            if op_to_group.get(op_id) != group.group_id:
-                continue
-            op = self.dag.get_op(op_id)
-            node = OpNode(
-                op_id=op_id,
-                op_type=op.op_type,
-                name=f"Op({op_id})",
-                phase=group.phase,
-                special_role=group.special_role,
-            )
-            op_parent.add_child(node)
-            op_index_out[op_id] = node
+__all__ = [
+    "GroupChoice",
+    "build_mapping_tree",
+]

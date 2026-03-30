@@ -115,6 +115,14 @@ class HardwareSpec:
         return ("DRAM", "SRAM", "PE")
 
     @property
+    def storage_levels(self) -> tuple[str, ...]:
+        return ("DRAM", "SRAM")
+
+    @property
+    def compute_levels(self) -> tuple[str, ...]:
+        return ("PE",)
+
+    @property
     def feed_bw(self) -> float:
         return self.sram.bw
 

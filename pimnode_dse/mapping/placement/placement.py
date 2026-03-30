@@ -2,464 +2,641 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import product
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from pimnode_dse.hardware.arch_spec import HardwareSpec
 from pimnode_dse.mapping.fusion.fusion_gene import FusionGene, FusionGroup
-from pimnode_dse.mapping.placement.node import GroupDP, PlacementPlan, StoreNode
+from pimnode_dse.mapping.placement.node import (
+    VALID_RESIDENCE,
+    GroupDP,
+    PlacementPlan,
+    ResidenceMode,
+    StoreNode,
+)
+
+if TYPE_CHECKING:
+    from pimnode_dse.mapping.workload.workload import WorkloadDAG
+
+
+PLAN_ID = "placement"
+NODE_ID = "n"
+NODE_ID_MAX = 64
+STORE_LEVELS = ("dram", "sram")
+PE_LEVEL = "pe"
+
+STATE_TAGS = ("cache", "state", "ctx")
+
+Cover = Tuple[Tuple[str, ...], ...]
+NodeSet = Tuple[StoreNode, ...]
+DpMap = Dict[str, Tuple[GroupDP, ...]]
+AllowMap = Dict[str, Tuple[str, ...]]
+ResidenceHint = Dict[str, ResidenceMode]
+
+# Key used for local node-set de-duplication inside _enum_level_nodes.
+# Must include residence so buffering/policy variants are not collapsed.
+NodeKey = Tuple[Tuple[str, Tuple[str, ...], ResidenceMode], ...]
+
+# Key used for position-ordered de-duplication inside enum_group_dp.
+PosKey = Tuple[Tuple[str, ...], Tuple[Tuple[str, Tuple[str, ...], ResidenceMode], ...]]
+
+# Role signatures used for placement signature.
+RoleSig = Tuple[Tuple[str, str, ResidenceMode], ...]
+PlaceSig = Tuple[Tuple[str, ...], RoleSig, RoleSig, RoleSig]
 
 
 @dataclass(frozen=True)
 class GroupCtx:
-    """Small placement-side group view.
+    group: str
+    tens: Tuple[str, ...]
+    levels: Tuple[str, ...]
+    ins: Tuple[str, ...] = ()
+    outs: Tuple[str, ...] = ()
+    temps: Tuple[str, ...] = ()
+    allow: AllowMap = field(default_factory=dict)
+    # Per-tensor residence hints: callers supply explicit policies;
+    # defaults are inferred from tensor role when absent.
+    residence_hint: ResidenceHint = field(default_factory=dict)
 
-    Placement should only consume this view. Workload and fusion specifics are
-    adapted at the file boundary.
-    """
+    def __post_init__(self) -> None:
+        group = str(self.group).strip()
+        if not group:
+            raise ValueError("group must not be empty")
 
-    id: str
-    inputs: tuple[str, ...] = ()
-    outputs: tuple[str, ...] = ()
-    temps: tuple[str, ...] = ()
-    edge_in: tuple[str, ...] = ()
-    edge_out: tuple[str, ...] = ()
-    ops: tuple[str, ...] = ()
-    phase: str | None = None
-    has_state: bool = False
-    has_update: bool = False
-    roles: dict[str, str] = field(default_factory=dict)
-    dims: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    reuse: tuple[str, ...] = ()
+        tens = _uniq(self.tens)
+        if not tens:
+            raise ValueError("tens must not be empty")
 
-    def tensors(self) -> tuple[str, ...]:
-        items: list[str] = []
-        seen: set[str] = set()
-        for bucket in (self.inputs, self.outputs, self.temps, self.edge_in, self.edge_out):
-            for tensor in bucket:
-                if tensor not in seen:
-                    seen.add(tensor)
-                    items.append(tensor)
-        return tuple(items)
+        levels = _norm_store_levels(self.levels)
+        ins = _subset_keep(self.ins, tens)
+        outs = _subset_keep(self.outs, tens)
+        temps = _subset_keep(self.temps, tens)
+        allow = _norm_allow(self.allow, levels)
+        residence_hint = _norm_residence_hint(self.residence_hint, tens)
 
-    def is_cross(self, tensor: str) -> bool:
-        return tensor in self.edge_in or tensor in self.edge_out
+        object.__setattr__(self, "group", group)
+        object.__setattr__(self, "tens", tens)
+        object.__setattr__(self, "levels", levels)
+        object.__setattr__(self, "ins", ins)
+        object.__setattr__(self, "outs", outs)
+        object.__setattr__(self, "temps", temps)
+        object.__setattr__(self, "allow", allow)
+        object.__setattr__(self, "residence_hint", residence_hint)
 
-    def role_of(self, tensor: str) -> str:
-        return self.roles.get(tensor, "UNK")
+    def levels_of(self, ten: str) -> Tuple[str, ...]:
+        name = str(ten).strip()
+        return self.allow.get(name, self.levels)
 
-    def dims_of(self, tensor: str) -> tuple[str, ...]:
-        return self.dims.get(tensor, ())
+    def residence_of(self, ten: str) -> ResidenceMode:
+        """Return the residence policy for a tensor.
+
+        Priority: explicit hint > role-based default.
+        Role defaults:
+          output  → evict   (written-back immediately, not retained)
+          state   → pinned  (permanently resident across iterations)
+          input   → single  (fetched once per tile, standard)
+          temp    → single
+        """
+        name = str(ten).strip()
+        if name in self.residence_hint:
+            return self.residence_hint[name]
+        if name in set(self.outs):
+            return "evict"
+        if _is_state_name(name):
+            return "pinned"
+        return "single"
 
 
-# -----------------------------
-# public API
-# -----------------------------
-
-def build_ctx(group: FusionGroup, workload: Any | None = None, gene: FusionGene | None = None) -> GroupCtx:
-    edge_in, edge_out = _find_edges(group.group_id, gene)
-    roles = _build_roles(group, workload)
-    dims = _build_dims(group, workload)
-    phase = _read_phase(group, workload)
-    reuse = _guess_reuse(group, workload)
-    has_state = any(_is_state_tensor(name) for name in (*edge_in, *edge_out, *group.inputs, *group.outputs))
-    has_update = any(_is_update_tensor(name) for name in (*group.outputs, *edge_out))
+def build_ctx(
+    group: FusionGroup,
+    workload: Optional["WorkloadDAG"] = None,
+    hw: Optional[HardwareSpec] = None,
+    levels: Optional[Sequence[str]] = None,
+    allow: Optional[AllowMap] = None,
+    residence_hint: Optional[ResidenceHint] = None,
+) -> GroupCtx:
+    tens = _group_tens(group, workload)
+    vals = _pick_store_levels(hw, levels)
     return GroupCtx(
-        id=group.group_id,
-        inputs=tuple(group.inputs),
-        outputs=tuple(group.outputs),
-        temps=tuple(group.temps),
-        edge_in=edge_in,
-        edge_out=edge_out,
-        ops=tuple(group.ops),
-        phase=phase,
-        has_state=has_state,
-        has_update=has_update,
-        roles=roles,
-        dims=dims,
-        reuse=reuse,
+        group=group.group_id,
+        tens=tens,
+        levels=vals,
+        ins=_uniq(group.inputs),
+        outs=_uniq(group.outputs),
+        temps=_uniq(group.temps),
+        allow=allow or {},
+        residence_hint=residence_hint or {},
     )
 
 
-def enum_group_dp(ctx: GroupCtx, top: int = 8) -> tuple[GroupDP, ...]:
-    """Enumerate placement candidates from structure, not templates.
-
-    Search dimensions are intentionally small:
-    - KV split or merge
-    - mid tensor keep or pass
-    - state update isolated or folded
-    - same-level slot order normalization
-    """
-
-    parts = _enum_part(ctx)
-    out: list[GroupDP] = []
-    seen: set[tuple[tuple[str, str, int, tuple[str, ...]], ...]] = set()
-
-    for part in parts:
-        nodes = _make_nodes(ctx, part)
-        if not nodes:
-            continue
-        nodes = _enum_slot(nodes)
-        dp = GroupDP(group=ctx.id, nodes=nodes)
-        if not _legal_dp(dp, ctx):
-            continue
-        key = _dp_key(dp)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(dp)
-
-    out.sort(key=lambda dp: (_score_dp(dp, ctx), len(dp.nodes), dp.group))
-    return tuple(out[: max(1, top)])
+def build_ctxs(
+    workload: Optional["WorkloadDAG"],
+    fusion: FusionGene,
+    hw: Optional[HardwareSpec] = None,
+    levels: Optional[Sequence[str]] = None,
+    allow: Optional[Dict[str, AllowMap]] = None,
+    residence_hint: Optional[Dict[str, ResidenceHint]] = None,
+) -> Dict[str, GroupCtx]:
+    out: Dict[str, GroupCtx] = {}
+    allow = allow or {}
+    residence_hint = residence_hint or {}
+    for group in fusion.groups:
+        out[group.group_id] = build_ctx(
+            group=group,
+            workload=workload,
+            hw=hw,
+            levels=levels,
+            allow=allow.get(group.group_id),
+            residence_hint=residence_hint.get(group.group_id),
+        )
+    return out
 
 
-def build_plan(
-    groups: Sequence[FusionGroup],
-    workload: Any | None = None,
-    gene: FusionGene | None = None,
-    plan_id: str = "placement",
-    top: int = 1,
-) -> PlacementPlan:
-    out: list[GroupDP] = []
-    for group in groups:
-        ctx = build_ctx(group, workload=workload, gene=gene)
-        cands = enum_group_dp(ctx, top=max(1, top))
-        if not cands:
-            continue
-        out.append(cands[0])
-    return PlacementPlan(id=plan_id, groups=tuple(out))
+def enum_group_dp(ctx: GroupCtx) -> Tuple[GroupDP, ...]:
+    by_sig: Dict[PlaceSig, GroupDP] = {}
+    seen_pos: Set[PosKey] = set()
+
+    for cover in _enum_cover(ctx):
+        for nodes in _enum_level_nodes(ctx, cover):
+            for placed in _enum_pos(ctx, nodes):
+                if not _legal_dp(ctx, placed):
+                    continue
+
+                pos_key = _pos_key(placed, ctx.levels)
+                if pos_key in seen_pos:
+                    continue
+                seen_pos.add(pos_key)
+
+                dp = GroupDP(group=ctx.group, nodes=placed)
+                sig = _place_sig(ctx, dp)
+
+                prev = by_sig.get(sig)
+                if prev is None:
+                    by_sig[sig] = dp
+                    continue
+
+                by_sig[sig] = _pick_place_rep(prev, dp)
+
+    return tuple(by_sig[sig] for sig in sorted(by_sig.keys()))
 
 
-def lower_plan(plan: PlacementPlan, tree: Any) -> Any:
-    """Attach placement metadata to an existing tree.
+def enum_dp(
+    workload: Optional["WorkloadDAG"],
+    fusion: FusionGene,
+    hw: Optional[HardwareSpec] = None,
+    levels: Optional[Sequence[str]] = None,
+    allow: Optional[Dict[str, AllowMap]] = None,
+    residence_hint: Optional[Dict[str, ResidenceHint]] = None,
+) -> DpMap:
+    out: DpMap = {}
+    ctxs = build_ctxs(
+        workload=workload,
+        fusion=fusion,
+        hw=hw,
+        levels=levels,
+        allow=allow,
+        residence_hint=residence_hint,
+    )
+    for group_id, ctx in ctxs.items():
+        out[group_id] = enum_group_dp(ctx)
+    return out
 
-    Tree mutation stays outside placement. This function only exposes placement
-    results for later builder work.
-    """
 
-    setattr(tree, "placement_plan", plan)
-    return tree
+def build_plan(selected: Sequence[GroupDP], plan_id: str = PLAN_ID) -> PlacementPlan:
+    return PlacementPlan(id=plan_id, groups=tuple(selected))
 
 
-def explain(dp: GroupDP) -> dict[str, list[dict[str, object]]]:
+def explain(dp: GroupDP) -> Dict[str, object]:
     return {
-        dp.group: [
+        "group": dp.group,
+        "nodes": [
             {
                 "id": node.id,
                 "level": node.level,
-                "kind": node.kind,
-                "slot": node.slot,
-                "axis": list(node.axis),
-                "tensors": list(node.tensors),
+                "pos": node.pos,
+                "residence": getattr(node, "residence", "single"),
+                "tens": list(node.tens),
             }
             for node in dp.nodes
-        ]
+        ],
     }
 
 
-# -----------------------------
-# structure enum
-# -----------------------------
+def _place_sig(ctx: GroupCtx, dp: GroupDP) -> PlaceSig:
+    home = {ten: dp.node_of(ten) for ten in ctx.tens}
 
-def _enum_part(ctx: GroupCtx) -> tuple[tuple[dict[str, object], ...], ...]:
-    inputs = tuple(sorted(ctx.inputs))
-    outputs = tuple(sorted(ctx.outputs))
-    mids = tuple(sorted(ctx.temps))
-    state_in = tuple(sorted(t for t in ctx.tensors() if _node_kind(ctx, t) == "state" and t not in ctx.outputs))
-    state_out = tuple(sorted(t for t in outputs if _node_kind(ctx, t) == "state"))
-    acc = tuple(sorted(t for t in outputs if _node_kind(ctx, t) == "acc"))
-    main_out = tuple(sorted(t for t in outputs if t not in state_out and t not in acc))
+    chain = tuple(
+        level
+        for level in ctx.levels
+        if any(str(home[ten].level).strip().lower() == level for ten in ctx.tens)
+    )
 
-    hold_inputs = tuple(t for t in inputs if t not in state_in)
-    kv = tuple(t for t in hold_inputs if ctx.role_of(t) in {"K", "V"})
-    rest_in = tuple(t for t in hold_inputs if t not in kv)
-
-    kv_modes: list[tuple[tuple[str, ...], ...]] = [()]
-    if kv:
-        kv_modes = [(kv,), *((t,) for t in kv)] if len(kv) <= 2 else [(kv,)]
-
-    mid_modes: list[tuple[tuple[str, ...], ...]] = [()]
-    if mids:
-        mid_modes = [(), (mids,)]
-        if len(mids) > 1:
-            mid_modes.append(tuple((t,) for t in mids))
-
-    state_out_modes: list[tuple[tuple[str, ...], ...]] = [()]
-    if state_out:
-        state_out_modes = [(state_out,)]
-        if len(state_out) > 1:
-            state_out_modes.append(tuple((t,) for t in state_out))
-
-    out: list[tuple[dict[str, object], ...]] = []
-    for kv_part, mid_part, state_part in product(kv_modes, mid_modes, state_out_modes):
-        spec: list[dict[str, object]] = []
-
-        for group in kv_part:
-            spec.append({"kind": "hold", "level": "sram", "tensors": tuple(group)})
-        if rest_in:
-            spec.append({"kind": "hold", "level": "sram", "tensors": rest_in})
-        if state_in:
-            spec.append({"kind": "state", "level": "sram", "tensors": state_in})
-        for group in mid_part:
-            spec.append({"kind": "flow", "level": "sram", "tensors": tuple(group)})
-        if acc:
-            spec.append({"kind": "acc", "level": "pe", "tensors": acc})
-        if main_out:
-            spec.append({"kind": "hold", "level": "sram", "tensors": main_out})
-        for group in state_part:
-            spec.append({"kind": "state", "level": "sram", "tensors": tuple(group)})
-
-        if spec:
-            out.append(tuple(spec))
-
-    if not out:
-        return ((),)
-    return tuple(dict.fromkeys(out))
-
-
-def _make_nodes(ctx: GroupCtx, part: Sequence[dict[str, object]]) -> tuple[StoreNode, ...]:
-    out: list[StoreNode] = []
-    for idx, item in enumerate(part):
-        tensors = tuple(item["tensors"])
-        if not tensors:
-            continue
-        kind = str(item["kind"])
-        level = str(item["level"])
-        axis = _pick_axis(ctx, tensors, kind)
-        out.append(
-            StoreNode(
-                id=f"{ctx.id}:{level}:{kind}:{idx}",
-                group=ctx.id,
-                level=level,
-                tensors=tensors,
-                slot=idx,
-                kind=kind,
-                axis=axis,
+    def role_sig(names: Sequence[str]) -> RoleSig:
+        return tuple(
+            sorted(
+                (ten, str(home[ten].level).strip().lower(), home[ten].residence)
+                for ten in names
             )
         )
+
+    return (
+        chain,
+        role_sig(ctx.ins),
+        role_sig(ctx.outs),
+        role_sig(ctx.temps),
+    )
+
+
+def _place_rank(dp: GroupDP) -> tuple:
+    nodes = tuple(sorted(dp.nodes, key=lambda item: item.pos))
+    return (
+        len(nodes),
+        tuple(
+            (
+                str(node.level).strip().lower(),
+                int(node.pos),
+                str(getattr(node, "residence", "single")).strip().lower(),
+                tuple(sorted(str(ten).strip() for ten in node.tens)),
+            )
+            for node in nodes
+        ),
+    )
+
+
+def _pick_place_rep(old: GroupDP, new: GroupDP) -> GroupDP:
+    return new if _place_rank(new) < _place_rank(old) else old
+
+
+def _group_tens(group: FusionGroup, workload: Optional["WorkloadDAG"]) -> Tuple[str, ...]:
+    vals = _uniq((*group.inputs, *group.outputs, *group.temps))
+    if vals:
+        return vals
+    if workload is None:
+        raise ValueError(f"group {group.group_id!r} has no tensor boundary and workload is missing")
+    raw = workload.subgraph_tensors(set(group.ops))
+    return _uniq((*raw.get("inputs", ()), *raw.get("outputs", ()), *raw.get("temps", ())))
+
+
+def _pick_store_levels(
+    hw: Optional[HardwareSpec],
+    levels: Optional[Sequence[str]],
+) -> Tuple[str, ...]:
+    if levels:
+        return _norm_store_levels(levels)
+    if hw is not None:
+        raw = getattr(hw, "levels", ())
+        if callable(raw):
+            raw = raw()
+        return _norm_store_levels(raw)
+    return STORE_LEVELS
+
+
+def _enum_cover(ctx: GroupCtx) -> Tuple[Cover, ...]:
+    out: List[Cover] = []
+
+    whole = _pack_cover(ctx.tens)
+    if whole:
+        out.append(whole)
+
+    split = _split_cover(ctx.tens)
+    if split:
+        out.append(split)
+
+    role = _role_cover(ctx)
+    if role:
+        out.append(role)
+
+    io = _io_cover(ctx)
+    if io:
+        out.append(io)
+
+    state = _state_cover(ctx)
+    if state:
+        out.append(state)
+
+    mc = _multicopy_cover(ctx)
+    if mc:
+        out.append(mc)
+
+    return _dedup_cover(out)
+
+
+def _role_cover(ctx: GroupCtx) -> Cover:
+    return _pack_cover(ctx.ins, ctx.outs, ctx.temps)
+
+
+def _io_cover(ctx: GroupCtx) -> Cover:
+    left = _uniq((*ctx.ins, *ctx.temps))
+    return _pack_cover(left, ctx.outs)
+
+
+def _state_cover(ctx: GroupCtx) -> Cover:
+    state = tuple(name for name in ctx.tens if _is_state_name(name))
+    other = tuple(name for name in ctx.tens if name not in set(state))
+    return _pack_cover(state, other)
+
+
+def _multicopy_cover(ctx: GroupCtx) -> Cover:
+    """Generate a double-buffer cover for eligible input tensors.
+
+    IMPORTANT: in design A, double-buffer is a *buffering mode* for a tensor at
+    its home level (typically SRAM). It does NOT introduce additional logical
+    replicas, so tensors must still appear exactly once across the cover.
+
+    We generate an alternative cover that splits each eligible input tensor into
+    its own singleton bucket, so it can be independently assigned to SRAM and
+    tagged as residence="double".
+    """
+    if "sram" not in ctx.levels:
+        return ()
+
+    eligible = tuple(t for t in ctx.ins if ctx.residence_hint.get(t, "") == "double")
+    if not eligible:
+        return ()
+
+    parts: list[tuple[str, ...]] = [(t,) for t in eligible]
+    other = tuple(t for t in ctx.tens if t not in set(eligible))
+    if other:
+        parts.append(other)
+
+    return _canon_cover(parts)
+
+
+def _pack_cover(*parts: Sequence[str]) -> Cover:
+    clean = [tuple(_uniq(part)) for part in parts if part]
+    if not clean:
+        return ()
+    return _canon_cover(clean)
+
+
+def _split_cover(items: Sequence[str]) -> Cover:
+    vals = _uniq(items)
+    if len(vals) <= 1:
+        return ()
+    return tuple((name,) for name in vals)
+
+
+def _dedup_cover(rows: Sequence[Cover]) -> Tuple[Cover, ...]:
+    out: List[Cover] = []
+    seen: Set[Cover] = set()
+    for row in rows:
+        if not row:
+            continue
+        if row in seen:
+            continue
+        flat = tuple(name for part in row for name in part)
+        if len(flat) != len(set(flat)):
+            continue
+        seen.add(row)
+        out.append(row)
     return tuple(out)
 
 
-def _enum_slot(nodes: Sequence[StoreNode]) -> tuple[StoreNode, ...]:
-    by_level: dict[str, list[StoreNode]] = {}
-    for node in nodes:
-        by_level.setdefault(node.level, []).append(node)
+def _is_state_name(name: str) -> bool:
+    text = str(name).strip().lower()
+    return any(tag in text for tag in STATE_TAGS)
 
-    out: list[StoreNode] = []
-    for level in sorted(by_level):
-        ordered = sorted(by_level[level], key=_slot_key)
-        for slot, node in enumerate(ordered):
-            out.append(
-                StoreNode(
-                    id=node.id,
-                    group=node.group,
-                    level=node.level,
-                    tensors=node.tensors,
-                    slot=slot,
-                    kind=node.kind,
-                    axis=node.axis,
-                )
+
+def _norm_residence_hint(raw: ResidenceHint, tens: Sequence[str]) -> ResidenceHint:
+    keep = set(tens)
+    out: ResidenceHint = {}
+    for ten, mode in dict(raw or {}).items():
+        name = str(ten).strip()
+        if not name or name not in keep:
+            continue
+        val = str(mode).strip().lower()
+        if val not in VALID_RESIDENCE:
+            continue
+        out[name] = val
+    return out
+
+
+def _node_residence(ctx: GroupCtx, tens: Sequence[str], level: str) -> ResidenceMode:
+    """Decide residence for a node given the bucket and chosen level."""
+    lv = str(level).strip().lower()
+
+    # If the bucket is exactly one input tensor and it is hinted as double,
+    # treat it as a double-buffer resident in SRAM.
+    if lv == "sram" and len(tens) == 1:
+        ten = str(tens[0]).strip()
+        if ten and ctx.residence_hint.get(ten) == "double":
+            return "double"
+
+    # Otherwise fall back to role-based default; if bucket contains mixed roles,
+    # pick the 'strongest' (most constraining) mode.
+    strength = {"single": 0, "evict": 1, "pinned": 2, "double": 3}
+    mode = "single"
+    for ten in tens:
+        m = ctx.residence_of(ten)
+        if strength.get(m, 0) > strength[mode]:
+            mode = m
+    return mode
+
+
+def _enum_level_nodes(ctx: GroupCtx, cover: Cover) -> Tuple[NodeSet, ...]:
+    if not cover:
+        return ()
+
+    modes: List[Tuple[str, ...]] = []
+    for tens in cover:
+        vals = _shared_levels(ctx, tens)
+        if not vals:
+            return ()
+        modes.append(vals)
+
+    out: List[NodeSet] = []
+    seen: Set[NodeKey] = set()
+
+    for combo in product(*modes):
+        nodes = tuple(
+            StoreNode(
+                id=_node_id(tens),
+                level=level,
+                pos=0,
+                tens=tens,
+                residence=_node_residence(ctx, tens, level),
             )
-    return tuple(sorted(out, key=lambda n: (n.level, n.slot, n.kind, n.id)))
+            for tens, level in zip(cover, combo)
+        )
+        key = _node_key(nodes)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(nodes)
+
+    return tuple(out)
 
 
-def _slot_key(node: StoreNode) -> tuple[int, int, str]:
-    kind_rank = {"state": 0, "hold": 1, "flow": 2, "acc": 3}
-    cross_rank = 0 if any(_is_state_tensor(t) for t in node.tensors) else 1
-    return (kind_rank.get(node.kind, 9), cross_rank, node.id)
+def _enum_pos(ctx: GroupCtx, nodes: Sequence[StoreNode]) -> Tuple[NodeSet, ...]:
+    if not nodes:
+        return ()
+
+    placed = tuple(
+        StoreNode(
+            id=node.id,
+            level=node.level,
+            pos=pos,
+            tens=node.tens,
+            residence=node.residence,
+        )
+        for pos, node in enumerate(sorted(nodes, key=_pos_sort_key(ctx)))
+    )
+    return (placed,)
 
 
-# -----------------------------
-# legality and score
-# -----------------------------
+def _pos_sort_key(ctx: GroupCtx):
+    def key(node: StoreNode) -> Tuple[int, Tuple[str, ...], str]:
+        return (_level_pos(ctx.levels, node.level), node.tens, node.id)
+    return key
 
-def _legal_dp(dp: GroupDP, ctx: GroupCtx) -> bool:
-    seen: dict[str, int] = {}
-    acc_seen = False
-    state_seen = False
 
-    for node in dp.nodes:
-        if node.kind == "acc":
-            if node.level != "pe":
+def _legal_dp(ctx: GroupCtx, nodes: Sequence[StoreNode]) -> bool:
+    if not nodes:
+        return False
+
+    ids: Set[str] = set()
+    pos: Set[int] = set()
+    hit: Dict[str, int] = {}
+
+    for node in nodes:
+        if node.id in ids:
+            return False
+        ids.add(node.id)
+
+        if node.pos in pos:
+            return False
+        pos.add(node.pos)
+
+        if node.level not in ctx.levels:
+            return False
+
+        for ten in node.tens:
+            if node.level not in ctx.levels_of(ten):
                 return False
-            acc_seen = True
-        if node.kind == "state":
-            state_seen = True
-        for tensor in node.tensors:
-            seen[tensor] = seen.get(tensor, 0) + 1
+            hit[ten] = hit.get(ten, 0) + 1
 
-    if ctx.outputs:
-        out_hit = set()
-        for node in dp.nodes:
-            for tensor in node.tensors:
-                if tensor in ctx.outputs:
-                    out_hit.add(tensor)
-        if set(ctx.outputs) - out_hit:
+        # Double-buffer only makes sense in SRAM.
+        if node.residence == "double" and node.level != "sram":
             return False
 
-    if ctx.has_state and not state_seen:
-        return False
-    if any(_node_kind(ctx, t) == "acc" for t in ctx.outputs) and not acc_seen:
+    if pos != set(range(len(nodes))):
         return False
 
-    for tensor in ctx.inputs:
-        if seen.get(tensor, 0) > 1 and _node_kind(ctx, tensor) != "state":
-            return False
-    for tensor in ctx.temps:
-        if seen.get(tensor, 0) > 1:
+    # Design A: no logical replicas at placement level.
+    for ten in ctx.tens:
+        if hit.get(ten, 0) != 1:
             return False
 
     return True
 
 
-def _score_dp(dp: GroupDP, ctx: GroupCtx) -> tuple[int, int, int, int]:
-    state_cnt = sum(1 for node in dp.nodes if node.kind == "state")
-    flow_cnt = sum(1 for node in dp.nodes if node.kind == "flow")
-    hold_cnt = sum(1 for node in dp.nodes if node.kind == "hold")
-    cross_front = 0
-    for node in dp.nodes:
-        if node.level == "sram" and node.slot == 0 and any(ctx.is_cross(t) for t in node.tensors):
-            cross_front = 1
-            break
-    return (-cross_front, state_cnt, flow_cnt, hold_cnt)
+def _shared_levels(ctx: GroupCtx, tens: Sequence[str]) -> Tuple[str, ...]:
+    keep: Optional[Tuple[str, ...]] = None
+    for ten in tens:
+        vals = ctx.levels_of(ten)
+        keep = vals if keep is None else tuple(level for level in keep if level in vals)
+    return keep or ()
 
 
-def _dp_key(dp: GroupDP) -> tuple[tuple[str, str, int, tuple[str, ...]], ...]:
-    return tuple((node.level, node.kind, node.slot, node.tensors) for node in dp.nodes)
+def _canon_cover(parts: Sequence[Sequence[str]]) -> Cover:
+    clean = [tuple(sorted(_uniq(part))) for part in parts if part]
+    clean.sort(key=lambda tens: (len(tens), tens))
+    return tuple(clean)
 
 
-# -----------------------------
-# internal helpers
-# -----------------------------
-
-def _find_edges(group_id: str, gene: FusionGene | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    if gene is None:
-        return (), ()
-    edge_in: list[str] = []
-    edge_out: list[str] = []
-    for src, dst, tensor in gene.group_edges_tensors:
-        if dst == group_id and tensor not in edge_in:
-            edge_in.append(tensor)
-        if src == group_id and tensor not in edge_out:
-            edge_out.append(tensor)
-    return tuple(edge_in), tuple(edge_out)
+def _node_id(tens: Sequence[str]) -> str:
+    parts = [name.lower().replace(":", "_").replace("-", "_") for name in tens]
+    parts = [part for part in parts if part]
+    if not parts:
+        return NODE_ID
+    text = "_".join(parts)
+    return text if len(text) <= NODE_ID_MAX else text[:NODE_ID_MAX]
 
 
-def _build_roles(group: FusionGroup, workload: Any | None) -> dict[str, str]:
-    roles: dict[str, str] = {}
-    if workload is not None and hasattr(workload, "get_tensor"):
-        for tensor in (*group.inputs, *group.outputs, *group.temps):
-            try:
-                spec = workload.get_tensor(tensor)
-                role = getattr(spec, "role", None)
-                if role is not None:
-                    roles[tensor] = str(role).split(".")[-1]
-            except Exception:
-                pass
-    for tensor in (*group.inputs, *group.outputs, *group.temps):
-        roles.setdefault(tensor, _guess_role(tensor))
-    return roles
+def _node_key(nodes: Sequence[StoreNode]) -> NodeKey:
+    rows = [(str(node.level).strip().lower(), tuple(node.tens), node.residence) for node in nodes]
+    rows.sort(key=lambda item: (_level_rank(item[0]), item[1], item[2]))
+    return tuple(rows)
 
 
-def _build_dims(group: FusionGroup, workload: Any | None) -> dict[str, tuple[str, ...]]:
-    dims: dict[str, tuple[str, ...]] = {}
-    if workload is not None and hasattr(workload, "get_op"):
-        for op_id in group.ops:
-            try:
-                op = workload.get_op(op_id)
-            except Exception:
-                continue
-            iter_dims = tuple(getattr(op, "iter_dims", ()) or ())
-            tensor_dims = dict(getattr(op, "tensor_dims", {}) or {})
-            for tensor, tensor_axes in tensor_dims.items():
-                if tensor in (*group.inputs, *group.outputs, *group.temps) and tensor_axes:
-                    dims[tensor] = tuple(tensor_axes)
-                elif tensor in (*group.inputs, *group.outputs, *group.temps) and iter_dims:
-                    dims.setdefault(tensor, iter_dims)
-    return dims
+def _pos_key(nodes: Sequence[StoreNode], levels: Sequence[str]) -> PosKey:
+    chain = _slot_chain(nodes, levels)
+    rows = tuple((str(node.level).strip().lower(), tuple(node.tens), node.residence) for node in nodes)
+    return (chain, rows)
 
 
-def _read_phase(group: FusionGroup, workload: Any | None) -> str | None:
-    phase = getattr(group, "phase", None)
-    if phase:
-        return str(phase)
-    spec = getattr(workload, "spec", None)
-    if spec is not None and hasattr(spec, "mode"):
-        return str(spec.mode)
-    return None
+def _slot_chain(nodes: Sequence[StoreNode], levels: Sequence[str]) -> Tuple[str, ...]:
+    out: List[str] = []
+    for node in sorted(nodes, key=lambda item: item.pos):
+        level = str(node.level).strip().lower()
+        if not out or out[-1] != level:
+            out.append(level)
+    if out:
+        return tuple(out)
+    vals = tuple(str(name).strip().lower() for name in levels)
+    return vals[:0]
 
 
-def _guess_reuse(group: FusionGroup, workload: Any | None) -> tuple[str, ...]:
-    axes: list[str] = []
-    if workload is not None and hasattr(workload, "get_op"):
-        for op_id in group.ops:
-            try:
-                op = workload.get_op(op_id)
-            except Exception:
-                continue
-            for axis in getattr(op, "iter_dims", ()) or ():
-                if axis not in axes:
-                    axes.append(axis)
-            for axis in getattr(op, "reduce_dims", ()) or ():
-                if axis not in axes:
-                    axes.append(axis)
-    if not axes:
-        return ("q", "k", "dh")
-    return tuple(axes)
+def _level_rank(level: str) -> Tuple[int, str]:
+    name = str(level).strip().lower()
+    return (0 if name in STORE_LEVELS else 1, name)
 
 
-def _node_kind(ctx: GroupCtx, tensor: str) -> str:
-    role = ctx.role_of(tensor)
-    if role in {"STATE", "CACHE"} or _is_state_tensor(tensor):
-        return "state"
-    if role in {"SCORES", "PROBS", "STATS"}:
-        return "flow"
-    if role in {"O", "ACC"} and tensor in ctx.outputs:
-        return "acc"
-    return "hold"
+def _level_pos(levels: Sequence[str], level: str) -> int:
+    want = str(level).strip().lower()
+    vals = tuple(str(name).strip().lower() for name in levels)
+    try:
+        return vals.index(want)
+    except ValueError:
+        return len(vals)
 
 
-def _pick_axis(ctx: GroupCtx, tensors: Sequence[str], kind: str) -> tuple[str, ...]:
-    axes: list[str] = []
-    for tensor in tensors:
-        for axis in ctx.dims_of(tensor):
-            if axis in ctx.reuse and axis not in axes:
-                axes.append(axis)
-    if axes:
-        return tuple(axes[:2])
-    if kind == "flow" and len(ctx.reuse) >= 2:
-        return tuple(ctx.reuse[:2])
-    if ctx.reuse:
-        return (ctx.reuse[0],)
-    return ()
+def _uniq(items: Iterable[str]) -> Tuple[str, ...]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in items:
+        name = str(raw).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
 
 
-def _guess_role(tensor: str) -> str:
-    name = tensor.upper()
-    if "CACHE" in name or "STATE" in name:
-        return "STATE"
-    if "SCORE" in name:
-        return "SCORES"
-    if "PROB" in name:
-        return "PROBS"
-    if "STAT" in name:
-        return "STATS"
-    if "PARTIAL" in name:
-        return "ACC"
-    if name.startswith("Q") or "_Q" in name:
-        return "Q"
-    if name.startswith("K") or "_K" in name:
-        return "K"
-    if name.startswith("V") or "_V" in name:
-        return "V"
-    if name.startswith("O") or "_O" in name:
-        return "O"
-    return "UNK"
+def _subset_keep(items: Iterable[str], full: Sequence[str]) -> Tuple[str, ...]:
+    keep = set(full)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in items:
+        name = str(raw).strip()
+        if not name or name not in keep or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
 
 
-def _is_state_tensor(name: str) -> bool:
-    upper = name.upper()
-    return "CACHE" in upper or "STATE" in upper
+def _norm_store_levels(levels: Iterable[str]) -> Tuple[str, ...]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in levels:
+        name = str(raw).strip().lower()
+        if not name or name == PE_LEVEL or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    if not out:
+        raise ValueError("store levels must not be empty")
+    return tuple(out)
 
 
-def _is_update_tensor(name: str) -> bool:
-    upper = name.upper()
-    return "APPEND" in upper or "CACHE_OUT" in upper or "STATE_OUT" in upper
+def _norm_allow(allow: AllowMap, levels: Sequence[str]) -> AllowMap:
+    vals = tuple(levels)
+    keep = set(vals)
+    out: AllowMap = {}
+    for ten, raw in allow.items():
+        name = str(ten).strip()
+        if not name:
+            continue
+        part = tuple(level for level in _norm_store_levels(raw) if level in keep)
+        out[name] = part or vals
+    return out

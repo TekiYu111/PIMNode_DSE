@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 
 
-GroupEdge = tuple[str, str]
-GroupEdgeTensor = tuple[str, str, str]
+GroupEdge = Tuple[str, str]
+GroupEdgeTensor = Tuple[str, str, str]
 
 
 @dataclass(frozen=True)

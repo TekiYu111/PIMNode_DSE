@@ -27,6 +27,8 @@ class RamulatorRunResult:
     average_ipc: Optional[float] = None
     total_instructions: Optional[int] = None
     noc_hops_avg: Optional[float] = None
+    total_energy_pj: Optional[float] = None   # sum of Bank[N] Total Trace Energy (pJ)
+    average_power_mw: Optional[float] = None  # derived from total_energy_pj / sim_time_ns * 1e6
     raw_stdout: str = ""
     raw_stderr: str = ""
     cfg_path: Optional[str] = None
@@ -58,6 +60,7 @@ def _patch_cfg_text(
     banks: int,
     channels: int,
     ranks: int,
+    enable_drampower: bool = True,
 ) -> str:
     replacements = {
         "trace": trace_file,
@@ -66,6 +69,7 @@ def _patch_cfg_text(
         "banks": str(banks),
         "channels": str(channels),
         "ranks": str(ranks),
+        "drampower_SIM": "brief" if enable_drampower else "off",
     }
 
     for key, value in replacements.items():
@@ -136,6 +140,22 @@ def _parse_pinos_output(stdout: str, stderr: str, returncode: int, cfg_path: str
         merged,
     )
 
+    # DRAMPower energy: sum all "Bank[N] Total Trace Energy: <X> pJ" lines.
+    # When drampower_SIM = brief/on in the cfg, pinos prints one line per bank.
+    bank_energies = re.findall(
+        rf"Bank\[\s*\d+\]\s*Total Trace Energy:\s*({_NUMBER_RE})\s*pJ",
+        merged,
+    )
+    if bank_energies:
+        total_pj = sum(float(e) for e in bank_energies)
+        result.total_energy_pj = total_pj
+        # Derive average power from sim time if available.
+        # total time line: "-> total time: <X>ns"
+        sim_time_ns = _extract_optional_float(rf"->\s*total time:\s*({_NUMBER_RE})\s*ns", merged)
+        if sim_time_ns and sim_time_ns > 0:
+            # power (mW) = energy (pJ) / time (ns) * 1e-3 [pJ/ns = mW]
+            result.average_power_mw = total_pj / sim_time_ns * 1e-3
+
     return result
 
 
@@ -151,9 +171,16 @@ def run_dram_simulation(
     banks: int = 1,
     channels: int = 1,
     ranks: int = 1,
+    enable_drampower: bool = True,
     timeout_sec: int = 300,
 ) -> RamulatorRunResult:
-    """Run pinos with a patched DRAM config and return parsed simulation results."""
+    """Run pinos with a patched DRAM config and return parsed simulation results.
+
+    When *enable_drampower* is True (the default), the config is patched with
+    ``drampower_SIM = brief`` so that pinos prints per-bank energy lines
+    (``Bank[N] Total Trace Energy: X pJ``), which are parsed into
+    ``total_energy_pj`` and ``average_power_mw`` on the returned result.
+    """
 
     pinos_binary = str(Path(pinos_binary).resolve())
     network_config = str(Path(network_config).resolve())
@@ -180,6 +207,7 @@ def run_dram_simulation(
         banks=banks,
         channels=channels,
         ranks=ranks,
+        enable_drampower=enable_drampower,
     )
 
     patched_cfg_path = output_dir / "dram_patched.cfg"
